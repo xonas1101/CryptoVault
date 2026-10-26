@@ -15,6 +15,20 @@
   <form class="card" method="post" action="/upload" enctype="multipart/form-data">
     <h2>🔒 Lock a new file</h2>
     <input type="file" name="file" required>
+    <label>Protection: pick any mix (the server key, a password, or both must hold the key)</label>
+    <label class="check"><input type="checkbox" name="layer" value="system" checked> <span><strong>Server key</strong>
+      <span class="muted small">RSA-3072. CryptoVault can open it for people you share with, no password needed.</span></span></label>
+    <label class="check"><input type="checkbox" name="layer" value="password"> <span><strong>Password</strong>
+      <span class="muted small">scrypt. Asked on every open. Alone, not even the server can read it.</span></span></label>
+    <label class="check"><input type="checkbox" name="layer" value="cascade"> <span><strong>Double encryption</strong>
+      <span class="muted small">ChaCha20-Poly1305 inside AES-256-GCM, independent keys.</span></span></label>
+    <label class="check"><input type="checkbox" name="layer" value="lockdown"> <span><strong>Lockdown</strong>
+      <span class="muted small">View-only for everyone, you included. The original can never be downloaded.</span></span></label>
+    <div class="row" style="margin:8px 0 12px">
+      <input type="password" name="password" placeholder="File password (if ticked)" autocomplete="new-password" style="flex:1">
+      <input type="password" name="confirm" placeholder="Repeat it" autocomplete="new-password" style="flex:1">
+    </div>
+    <p class="small muted">Really confidential? Tick all four.</p>
     <button class="primary">Encrypt &amp; store</button>
   </form>
   <form class="card" method="post" action="/open" enctype="multipart/form-data">
@@ -32,10 +46,11 @@
     <p class="muted">You haven't locked anything yet.</p>
   {% else %}
   <div class="table-wrap"><table>
-    <tr><th>Name</th><th>Size</th><th>Shared with</th><th>Locked</th></tr>
+    <tr><th>Name</th><th>Protection</th><th>Size</th><th>Shared with</th><th>Locked</th></tr>
     {% for f in mine %}
     <tr>
       <td><a href="/file/{{ f.id }}" style="color:var(--accent)"><strong>{{ f.name }}</strong></a></td>
+      <td>{% for l in f.layers %}<span class="badge">{{ LAYER_NAMES[l] }}</span> {% endfor %}</td>
       <td>{{ f.size | size }}</td>
       <td class="small">
         {% for email, s in f.shares.items() %}{{ email }} <span class="badge">{{ s.perm }}</span><br>{% else %}<span class="muted">only you</span>{% endfor %}
@@ -53,11 +68,12 @@
     <p class="muted">Nothing has been shared with {{ user }} yet.</p>
   {% else %}
   <div class="table-wrap"><table>
-    <tr><th>Name</th><th>Owner</th><th>You can</th><th>Access until</th></tr>
+    <tr><th>Name</th><th>Owner</th><th>Protection</th><th>You can</th><th>Access until</th></tr>
     {% for f in shared %}
     <tr>
       <td>{% if f.expired %}<strong class="muted">{{ f.name }}</strong>{% else %}<a href="/file/{{ f.id }}" style="color:var(--accent)"><strong>{{ f.name }}</strong></a>{% endif %}</td>
       <td>{{ f.owner }}</td>
+      <td>{% for l in f.layers %}<span class="badge">{{ LAYER_NAMES[l] }}</span> {% endfor %}</td>
       <td><span class="badge">{{ "view + download" if f.perm == "download" else "view only" }}</span></td>
       <td class="small">{% if f.expired %}<span class="badge warn">expired {{ f.until | day }}</span>{% else %}{{ f.until | day }}{% endif %}</td>
     </tr>

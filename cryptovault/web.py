@@ -14,7 +14,7 @@ from flask import Flask, abort, flash, redirect, render_template, request, send_
 
 from . import preview
 from .crypto import CryptoError
-from .vault import AccessDenied, Vault, VaultError
+from .vault import AccessDenied, PasswordRequired, Vault, VaultError
 
 IDLE_TIMEOUT = 15 * 60
 MAX_UPLOAD = 100 * 1024 * 1024
@@ -30,7 +30,7 @@ def create_app(vault: Vault):
     )
     v = vault
     # ponytail: in-process session table, so this works with a single server process only
-    sessions = {}  # random token -> {"user", "seen"}
+    sessions = {}  # random token -> {"user", "seen", "keys": {file id: password-derived key}}
 
     def current():
         token = session.get("token")
@@ -44,8 +44,13 @@ def create_app(vault: Vault):
 
     def start(user):
         token = secrets.token_urlsafe(32)  # fresh token on every login, which prevents session fixation
-        sessions[token] = {"user": user, "seen": time.time()}
+        sessions[token] = {"user": user, "seen": time.time(), "keys": {}}
         session["token"] = token
+
+    def key_for(fid):
+        # ponytail: unlocked file keys live in server memory until logout or idle timeout, so each
+        # preview image doesn't re-run scrypt; a per-file timeout if that's too generous
+        return sessions[session["token"]]["keys"].get(fid)
 
     def home():
         return redirect(url_for("index"))
@@ -72,6 +77,9 @@ def create_app(vault: Vault):
         resp.headers["Content-Security-Policy"] = ("default-src 'none'; img-src 'self'; "
                                                    "style-src 'unsafe-inline'; form-action 'self'")
         return resp
+
+    app.jinja_env.globals["LAYER_NAMES"] = {"system": "server key", "password": "password",
+                                            "cascade": "double encryption", "lockdown": "lockdown"}
 
     @app.template_filter("when")
     def when(ts):
@@ -137,7 +145,10 @@ def create_app(vault: Vault):
         f = request.files.get("file")
         if not f or not f.filename:
             raise VaultError("choose a file first")
-        fid = v.store(user, f.filename, f.read())
+        password = request.form.get("password") or None
+        if password != (request.form.get("confirm") or None):
+            raise VaultError("the file passwords do not match")
+        fid = v.store(user, f.filename, f.read(), request.form.getlist("layer"), password)
         flash(f"Locked {f.filename}. Share it below.", "ok")
         return redirect(url_for("file_page", fid=fid))
 
@@ -152,7 +163,10 @@ def create_app(vault: Vault):
     @app.get("/file/<fid>")
     @logged_in
     def file_page(user, fid):
-        data, meta, perm = v.read(fid, user, "view")
+        try:
+            data, meta, perm = v.read(fid, user, "view", key_for(fid))
+        except PasswordRequired as e:
+            return render_template("unlock.html", user=user, fid=fid, message=str(e))
         k = preview.kind(meta["type"])
         text = data[:preview.MAX_TEXT * 4].decode("utf-8", "replace")[:preview.MAX_TEXT] if k == "text" else None
         try:
@@ -164,10 +178,19 @@ def create_app(vault: Vault):
                                pages=pages, activity=activity, log_broken_at=broken_at,
                                info=v.inspect(fid, user))
 
+    @app.post("/file/<fid>/unlock")
+    @logged_in
+    def unlock(user, fid):
+        try:
+            sessions[session["token"]]["keys"][fid] = v.unlock_file(fid, user, request.form.get("password", ""))
+        except AccessDenied as e:
+            flash(str(e), "error")
+        return redirect(url_for("file_page", fid=fid))
+
     @app.get("/file/<fid>/page/<int:n>.png")
     @logged_in
     def page_image(user, fid, n):
-        data, meta, _ = v.read(fid, user, action=None)  # the view itself was already logged by file_page
+        data, meta, _ = v.read(fid, user, None, key_for(fid))  # the view itself was already logged by file_page
         try:
             png = preview.render_page(data, preview.kind(meta["type"]), n, user)
         except Exception:
@@ -177,7 +200,7 @@ def create_app(vault: Vault):
     @app.get("/file/<fid>/download")
     @logged_in
     def download(user, fid):
-        data, meta, _ = v.read(fid, user, "download")
+        data, meta, _ = v.read(fid, user, "download", key_for(fid))
         return send_file(io.BytesIO(data), as_attachment=True, download_name=meta["name"],
                          mimetype="application/octet-stream")  # never rendered inline
 

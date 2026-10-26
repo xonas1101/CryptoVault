@@ -28,7 +28,7 @@ system honestly can't do, and how to present it.
 
 A file-sharing system where **files can't escape**:
 
-- You **lock** (upload) a file. It is encrypted with hybrid encryption the moment it arrives.
+- You **lock** (upload) a file and **pick its protection**: server key, password, double encryption, lockdown, in any mix. A password-only lock for everyday files, all four for really confidential ones.
 - You **share** it with other people **by email address**, as **view only** or **view + download**, optionally with an **expiry date**.
 - Recipients see a **preview with their own email watermarked** across it.
 - If someone downloads, they get a **locked `.cvault` copy**. It opens only inside CryptoVault, only for people the owner *currently* allows. Forward it to someone else and it's useless. Revoke someone and the copy they already downloaded stops working.
@@ -51,7 +51,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-python -m unittest -v              # 30 tests: crypto, tampering, access control, web
+python -m unittest -v              # 35 tests: crypto, tampering, access control, web
 python -m cryptovault --demo       # start the server with demo accounts and files
 ```
 
@@ -59,7 +59,7 @@ Open **http://127.0.0.1:8000**.
 
 - **First start:** you choose a **master passphrase** (12+ characters). It unlocks the system key. Without it, nothing in the vault can be decrypted, not even by the server.
 - **Later starts:** you type the same passphrase. A wrong passphrase means the server refuses to start.
-- **`--demo`** (only into an empty vault) creates `alice@gmail.com`, `bob@gmail.com` and `eve@gmail.com` (passwords `alice-password` etc.). Alice owns a text file, an image and a 3-page PDF, shared with Bob in different ways. Eve has nothing.
+- **`--demo`** (only into an empty vault) creates `alice@gmail.com`, `bob@gmail.com` and `eve@gmail.com` (passwords `alice-password` etc.). Alice owns three files at three protection levels, all shared with Bob: `launch-plan.txt` (all four layers, file password `launch-password`), `prototype.png` (server key only) and `contract.pdf` (password only, `contract-password`). Eve has nothing.
 
 Other options: `--vault DIR` (default `./vault`), `--port`, `--host`.
 `CRYPTOVAULT_MASTER_PASSWORD` skips the passphrase prompt **for scripted demos only**
@@ -77,9 +77,9 @@ Other options: `--vault DIR` (default `./vault`), `--port`, `--host`.
 | `cryptovault/preview.py` | Watermarked previews: images and PDF pages rendered to PNG with the viewer's email burned in. |
 | `cryptovault/web.py` | Flask web app: turns HTTP requests into vault calls. No security logic of its own beyond sessions and headers. |
 | `cryptovault/cli.py` | Starts the server: master passphrase prompt, `--demo` seeding. |
-| `cryptovault/templates/` | HTML pages: login, dashboard, file page. |
-| `tests/test_vault.py` | 24 tests: encryption, every tampering attack, access control, expiry, locked copies, users table, audit log. |
-| `tests/test_web.py` | 6 tests: the full share → view-only → locked copy → forward → revoke story through the web UI, watermarks, XSS, permissions. |
+| `cryptovault/templates/` | HTML pages: login, dashboard, file page, file-password prompt. |
+| `tests/test_vault.py` | 28 tests: encryption, every protection-layer combination, every tampering attack (including stripping layers), access control, expiry, locked copies, users table, audit log. |
+| `tests/test_web.py` | 7 tests: password-locked files, the full share → view-only → locked copy → forward → revoke story through the web UI, watermarks, XSS, permissions. |
 
 The vault on disk (git-ignored):
 
@@ -123,6 +123,41 @@ Hybrid design pays off three times here:
 - **Sharing and revoking are cheap.** They change the access list in the small metadata block. The (possibly huge) encrypted data is never re-encrypted.
 - **Changing the master passphrase** would only re-seal one small file. No file would change.
 
+### 4.1 Protection layers: the owner picks, per file
+
+The diagram above is the default (**server key** only). When locking a file, the owner
+ticks any mix of four layers. The rule: **at least one of the first two must hold the key.**
+
+| Layer | What it adds | Crypto | Cost |
+|---|---|---|---|
+| **Server key** | CryptoVault can open the file by itself, so recipients need no password and get watermarked previews | RSA-3072-OAEP wraps K | the server can read the content |
+| **Password** | everyone must type the file password on every open (once per login session). **Without it, not even the server can read the content.** | scrypt(file password) | the password has to reach recipients some other way |
+| **Double encryption** | the data is encrypted twice, under independent keys: a break of one cipher isn't enough | ChaCha20-Poly1305 inside AES-256-GCM | slightly slower |
+| **Lockdown** | view-only for everyone, **the owner included**: the original can never be downloaded, so a stolen login can't take it either | policy, enforced by the vault; can't be removed (see below) | nobody gets the original back out |
+
+Typical choices: **password only** for something personal ("only someone who knows the
+password, and not even the admin"); **server key** for easy sharing; **all four** for
+really confidential data.
+
+How the keys combine (`Vault._content_keys`):
+
+```
+ secret = (K           if "server key" ticked) ‖ (scrypt(password) if "password" ticked)
+             │ HKDF (salt = file id), one label per job
+   ┌─────────┼──────────────┬──────────────┐
+   ▼         ▼              ▼              ▼
+ data key  cascade key   digest key    check key
+ AES-GCM   ChaCha20-     HMAC of the   proves the password is right
+ STREAM    Poly1305      plaintext     without trying to decrypt
+```
+
+- With **both** server key and password, the secret needs **both**: the server's K alone gives nothing, and the password alone gives nothing.
+- The **metadata key is always derived from K alone**, so the server can still list files, show names and enforce access lists even for password-only files. (That means names and sizes are visible to the server; the content isn't.)
+- The **layer list is in the header, and the header is the AAD.** Removing a layer from the header (a *downgrade attack*) makes the metadata fail its tag, so the file is reported as damaged instead of opening with weaker protection (test: `test_layers_cannot_be_stripped`).
+- The metadata stores an **HMAC** of the content, not a plain SHA-256. A plain hash would let the server confirm guesses about a password-only file ("is it this contract?"). The HMAC key comes from the content secret, so it can't.
+- A wrong file password is detected with the check value and **logged as a denial**. scrypt makes each guess cost ~50 ms and 32 MiB.
+- After a correct password, the derived key (never the password) is kept in the server's session table until logout or the 15-minute idle timeout, so preview pages don't re-run scrypt.
+
 ---
 
 ## 5. Every algorithm, and why
@@ -151,7 +186,8 @@ nonce (12 bytes) = random prefix (7) | segment counter (4) | is-last-segment fla
 - Cut off the end → the new final segment was encrypted with flag 0 but is now checked with flag 1 → tag fails.
 
 ### 5.4 HKDF-SHA256: key separation
-One secret → many independent keys, **one per job**. File key K → data key + metadata key.
+One secret → many independent keys, **one per job**. File key K → metadata key; the content
+secret → data key, cascade key, digest key, password-check key (section 4.1).
 MAC key → users-table key + audit-log key. Key separation guarantees that a mistake or
 attack involving one use can never spill over into another.
 
@@ -160,17 +196,26 @@ attack involving one use can never spill over into another.
 |---|---|---|---|
 | **Seal the master key** | master passphrase + salt | AES key that encrypts `system.key.json` | no, re-derived at each start |
 | **Hash user passwords** | user password + per-user salt | 32-byte hash | yes, in `users.json` |
+| **File password layer** | file password + per-file salt | 32-byte key mixed into the content secret | no, only the salt and parameters (in the header) |
 
 scrypt is **memory-hard** (32 MiB per guess here), which blunts GPU/ASIC cracking far more
 than SHA-256 or PBKDF2. Salts defeat rainbow tables. Password checks use **constant-time
 comparison**, and unknown emails are checked against a dummy hash so **response time doesn't
 reveal which emails have accounts**.
 
-### 5.6 HMAC-SHA256: integrity for things that aren't encrypted
+### 5.6 ChaCha20-Poly1305: the cascade layer
+A completely different design from AES-GCM (an ARX stream cipher with a Poly1305 MAC, by
+Bernstein; used in TLS 1.3, WireGuard and Signal). With double encryption on, the whole
+file is sealed with ChaCha20-Poly1305 first and the result goes through AES-256-GCM STREAM.
+The keys are independent (separate HKDF labels), so an attacker has to break **both**
+ciphers. This is "defence in depth" against a future cryptanalytic break, not something
+needed today.
+
+### 5.7 HMAC-SHA256: integrity for things that aren't encrypted
 - **`users.json`**: without a MAC, an attacker with disk access could add an account or copy a password hash. With it, any change is detected (test: `test_users_table_tamper_detected`).
 - **The audit log**: an **HMAC hash chain**. Each entry contains the previous entry's MAC and its own MAC over all its fields. Edit, delete, insert or reorder any entry and the chain breaks from that point on (test: `test_audit_log_tamper_detected`, which tries to frame Bob for Eve's denied attempt).
 
-### 5.7 Randomness
+### 5.8 Randomness
 Every key, nonce, salt, file id and session token comes from the OS CSPRNG (`os.urandom` /
 `secrets`). Python's `random` module must never be used for cryptography.
 
@@ -180,7 +225,7 @@ Every key, nonce, salt, file id and session token comes from the OS CSPRNG (`os.
 
 ```
 ┌───────┬─────┬───────────────────────┬─────┬───────────────────────┬────────────────────────────┐
-│CVLT3  │ len │ header (JSON, public) │ len │ sealed metadata       │ segment 0 │ segment 1 │ …  │
+│CVLT4  │ len │ header (JSON, public) │ len │ sealed metadata       │ segment 0 │ segment 1 │ …  │
 │5 bytes│ u32 │ AAD for everything    │ u32 │ nonce|AES-GCM|tag     │ 64 KiB + 16-byte tag each  │
 └───────┴─────┴───────────────────────┴─────┴───────────────────────┴────────────────────────────┘
 ```
@@ -189,12 +234,15 @@ Every key, nonce, salt, file id and session token comes from the OS CSPRNG (`os.
 ```json
 { "file_id": "65b39ea49d87782e06f5a92bae0d0bfc",
   "nonce_prefix": "LoivrzlEDw==",
-  "wrapped_key": "<RSA-OAEP(system public key, K)>" }
+  "wrapped_key": "<RSA-OAEP(system public key, K)>",
+  "layers": ["system", "password", "cascade", "lockdown"],
+  "kdf": { "salt": "…", "n": 32768, "r": 8, "p": 1 } }        // null without a password layer
 ```
 
 **Metadata** (encrypted and authenticated):
 ```json
-{ "name": "contract.pdf", "size": 65123, "sha256": "…", "type": "application/pdf",
+{ "name": "contract.pdf", "size": 65123, "digest": "<HMAC>", "check": "<only with a password>",
+  "type": "application/pdf",
   "owner": "alice@gmail.com", "created": 1793030400,
   "shares": { "bob@gmail.com": { "perm": "download", "until": null } } }
 ```
@@ -211,16 +259,19 @@ Open any file in the UI and expand **"Under the hood"** to see the real header a
 ## 7. How each feature works
 
 **Lock (upload).** Generate K and a file id → wrap K with the system **public** key →
-derive the data and metadata keys → encrypt the metadata → STREAM-encrypt the data → write
+(if a password layer: scrypt the password) → derive the keys from the chosen layers →
+(if double encryption: ChaCha20-Poly1305 the data) → encrypt the metadata → STREAM-encrypt the data → write
 to a temp file and atomically rename it (a crash never leaves a half-written file).
 
 **View.** Check the permission (owner / download / view, and not expired) → unwrap K →
-decrypt and verify every segment → check SHA-256 → render a preview:
+(if a password layer and not yet unlocked this session: ask for the password) →
+decrypt and verify every segment → (if double encryption: open the ChaCha20 layer) →
+check the HMAC digest → render a preview:
 - **text**: shown in the page with a tiled watermark overlay; text selection is disabled
 - **images and PDFs**: rendered on the server into PNGs with the viewer's email and the time **burned into the pixels** (the browser never receives the original file)
 - **other types**: no preview; view-only users have to ask for download permission
 
-**Download original.** Only the owner, or recipients granted *view + download*. Sent as
+**Download original.** Only the owner, or recipients granted *view + download*, and never for a locked-down file. Sent as
 `application/octet-stream` with `Cache-Control: no-store`.
 
 **Download locked copy.** Anyone with access gets the `.cvault` container itself. It
@@ -288,6 +339,10 @@ send passwords in the clear, and the server warns about that.
 | Public-key substitution detected | key-pair check on start | `test_system_public_key_swap_detected` |
 | The whole story through the UI | – | `test_view_only_share_full_story` |
 | Previews are watermarked | Pillow rendering | `test_image_and_pdf_previews_are_watermarked` |
+| Every mix of layers works; a key holder is required | `_content_keys` | `test_every_layer_combination_round_trips` |
+| Password layer: server alone can't decrypt, wrong guesses logged, metadata can't confirm guesses | scrypt + HKDF + HMAC digest | `test_password_layer`, `test_password_locked_file` |
+| Layers can't be stripped (downgrade) | layer list is AAD | `test_layers_cannot_be_stripped` |
+| Lockdown blocks downloads for everyone | vault check + share check | `test_lockdown_blocks_every_download` |
 
 ---
 
@@ -309,6 +364,11 @@ can do*, and that's only possible if recipients never hold the key. The price is
 **must trust the server** (and whoever knows the master passphrase). Stating this trade-off
 clearly is a strength in a presentation, not a weakness.
 
+**The password layer gives each owner this choice per file.** Tick only *password* and you
+get the end-to-end column for that file's content: the server can't read it, but then the
+password itself is what you share, and anyone who learns it and is on the access list can
+read the file. Tick *server key* and you get the right-hand column.
+
 > The project's git history contains an earlier end-to-end version
 > (commit `1225545`: per-user RSA + Ed25519 keys, sign-then-encrypt, revocation by re-keying).
 > It makes a good "alternative design we considered" slide.
@@ -324,7 +384,8 @@ or expiry; users opening files not shared with them.
 
 **Does NOT protect against:**
 - **The "analog hole".** Anyone who can *see* a file can photograph or screenshot it, or retype it. No system can stop this. Google, Microsoft and Netflix included, they all only deter. Watermarking turns a leak into **evidence of who leaked it**.
-- **A malicious or compromised server.** The server holds the key by design (section 10).
+- **A malicious or compromised server.** The server holds the key by design (section 10). Files with a password layer are the exception for content at rest, but a malicious server could still capture the password the next time someone types it in.
+- **Weak file passwords.** Someone with the vault and the master passphrase can try guesses offline. scrypt slows each guess down; it can't save `password123`.
 - **Unverified email addresses.** Anyone can register as `bob@gmail.com` if Bob hasn't yet, and receive files shared with that address. Fix: real "Sign in with Google" (OAuth). See extensions.
 - **Rollback.** An attacker with disk write access could put back an *older* valid copy of a `.cvault` file (e.g. one from before a revocation) or of `users.json`. Fix: store a version counter in a trusted place.
 - **Log truncation.** Deleting entries from the **end** of the audit log leaves a valid, shorter chain. Fix: periodically publish the latest MAC somewhere outside the server.
@@ -343,7 +404,8 @@ Start: `python -m cryptovault --demo`, then open two browser windows (one privat
 1. **The problem** (1 min): "I want to share a document but control what happens to it."
 2. **Hybrid encryption** (2 min): the key-hierarchy diagram in section 4.
 3. **Live demo** (5 min):
-   1. *Alice* uploads a file, shares it with Bob as **view only** with an **expiry date**.
+   1. *Alice* uploads a file, ticks **all four layers** and shares it with Bob as **view only** with an **expiry date**. Point at the protection badges.
+   1. *Bob* opens `contract.pdf` (password only): he is asked for the password. Wrong one → Alice's log shows the denial.
    2. *Bob* opens it: the preview is **watermarked with his email**. There's no "download original" button.
    3. *Bob* downloads the **locked copy** and opens it in a text editor: just ciphertext.
    4. *Eve* uploads Bob's locked copy via "Open a locked file" → **denied**.
@@ -358,7 +420,9 @@ Start: `python -m cryptovault --demo`, then open two browser windows (one privat
 - *Why not just encrypt files with RSA?* Size limit (~318 bytes) and speed.
 - *Why do you need STREAM?* Encrypting segments independently allows reordering and truncation attacks.
 - *What stops Bob from sending the file?* He can send the locked copy, but it's useless. He can't get the key, because he never has it. He *can* photograph the screen, which is why there's a watermark.
-- *Can the admin read files?* Yes, by design: that's the price of view-only control (section 10).
+- *Can the admin read files?* With the server key layer, yes, by design: that's the price of view-only control (section 10). With a password layer, not the content.
+- *Why is double encryption useful if AES isn't broken?* It isn't needed today. It's insurance: an attacker must break two unrelated ciphers, with independent keys.
+- *Couldn't someone just delete the "password" layer from the file header?* The header is the AAD, so the metadata tag fails and the file shows as damaged.
 - *Why scrypt?* It's memory-hard, which makes GPU cracking expensive. SHA-256 is designed to be fast, which is the opposite of what you want for passwords.
 - *What if someone edits the access list on disk?* It's inside AES-GCM, so the tag fails and the file is reported as damaged.
 - *What if someone edits the log?* The HMAC chain breaks, and they can't recompute it without the MAC key, which is sealed under the master passphrase.
@@ -392,6 +456,9 @@ Start: `python -m cryptovault --demo`, then open two browser windows (one privat
 | Envelope encryption | The industry name for this KEK/DEK pattern (AWS KMS, Google Cloud KMS) |
 | OAEP | Secure randomized padding for RSA encryption |
 | STREAM | Segmented AEAD where nonces encode position and finality |
+| Protection layer | One protection the owner chose for a file: server key, password, double encryption, lockdown |
+| Cascade | Encrypting with two ciphers in sequence under independent keys |
+| Downgrade attack | Tricking a system into using weaker protection than intended |
 | HKDF | Derives several independent keys from one secret |
 | scrypt | Slow, memory-hard function for passwords |
 | Salt | Random per-item value that defeats precomputed tables |

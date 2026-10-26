@@ -1,4 +1,6 @@
 """Security tests for the vault. Run: python -m unittest -v"""
+import hashlib
+import itertools
 import json
 import os
 import tempfile
@@ -8,7 +10,7 @@ from pathlib import Path
 
 from cryptovault import crypto
 from cryptovault.crypto import CHUNK, TAG, CryptoError, b64e, canon
-from cryptovault.vault import MAGIC, AccessDenied, Vault, VaultError, _block, _read_container
+from cryptovault.vault import LAYERS, MAGIC, AccessDenied, PasswordRequired, Vault, VaultError, _block, _read_container
 
 MASTER = "correct horse battery staple"
 ALICE, BOB, EVE = "alice@gmail.com", "bob@gmail.com", "eve@gmail.com"
@@ -123,6 +125,52 @@ class VaultTest(unittest.TestCase):
         fid = self.v.store(ALICE, "f", b"data")
         self.tamper(fid, lambda b, off: b[:off - 3] + bytes([b[off - 3] ^ 1]) + b[off - 2:])
         self.assertIn(fid, self.v.files_for(ALICE)[2])
+
+    # ---------- protection layers ----------
+
+    def test_every_layer_combination_round_trips(self):
+        data = os.urandom(CHUNK + 99)
+        for n in range(1, len(LAYERS) + 1):
+            for layers in itertools.combinations(LAYERS, n):
+                if not {"system", "password"} & set(layers):
+                    with self.assertRaisesRegex(VaultError, "hold the key"):
+                        self.v.store(ALICE, "f", data, layers)
+                    continue
+                fid = self.v.store(ALICE, "f", data, layers, "file-password")
+                key = self.v.unlock_file(fid, ALICE, "file-password") if "password" in layers else None
+                self.assertEqual(self.v.read(fid, ALICE, pw_key=key)[0], data, layers)
+
+    def test_password_layer(self):
+        data = b"only with the password"
+        fid = self.v.store(ALICE, "f", data, ["password"], "file-password")
+        self.v.share(fid, ALICE, BOB, "view")
+        with self.assertRaises(PasswordRequired):  # the server alone can't open it, not even for the owner
+            self.v.read(fid, ALICE)
+        with self.assertRaisesRegex(AccessDenied, "wrong file password"):
+            self.v.unlock_file(fid, BOB, "guess-guess")
+        with self.assertRaises(AccessDenied):  # knowing the password doesn't help without access
+            self.v.unlock_file(fid, EVE, "file-password")
+        self.assertEqual(self.v.read(fid, BOB, pw_key=self.v.unlock_file(fid, BOB, "file-password"))[0], data)
+        with self.assertRaises(CryptoError):  # a made-up key fails authentication
+            self.v.read(fid, BOB, pw_key=os.urandom(32))
+        meta = self.v.read(fid, BOB, pw_key=self.v.unlock_file(fid, BOB, "file-password"))[1]
+        self.assertNotIn(hashlib.sha256(data).hexdigest(), json.dumps(meta))  # metadata can't confirm guesses
+        self.assertIn(("denied", BOB), [(e["action"], e["actor"]) for e in self.v.activity(fid, ALICE)[0]])
+
+    def test_layers_cannot_be_stripped(self):
+        """Downgrade attack: remove the password or cascade layer from the header."""
+        for layer in ("password", "cascade", "lockdown"):
+            fid = self.v.store(ALICE, "f", b"data", ["system", layer], "file-password")
+            self.rewrite_header(fid, lambda h: h.update(layers=["system"]))
+            self.assertBroken(fid)
+
+    def test_lockdown_blocks_every_download(self):
+        fid = self.v.store(ALICE, "f", b"data", ["system", "lockdown"])
+        self.v.read(fid, ALICE, "view")
+        with self.assertRaisesRegex(AccessDenied, "locked down"):
+            self.v.read(fid, ALICE, "download")
+        with self.assertRaisesRegex(VaultError, "view-only"):
+            self.v.share(fid, ALICE, BOB, "download")
 
     # ---------- access control ----------
 

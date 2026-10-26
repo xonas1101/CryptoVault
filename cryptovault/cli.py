@@ -46,13 +46,16 @@ def seed(v: Vault):
     pages[0].save(pdf, "PDF", save_all=True, append_images=pages[1:])
 
     alice = "alice@gmail.com"
-    plan = v.store(alice, "launch-plan.txt", b"Q3 launch plan\n\n1. Ship on 1 Dec\n2. Do not tell anyone\n")
+    # one file per protection level: everything, server key only, password only
+    plan = v.store(alice, "launch-plan.txt", b"Q3 launch plan\n\n1. Ship on 1 Dec\n2. Do not tell anyone\n",
+                   ["system", "password", "cascade", "lockdown"], "launch-password")
     logo = v.store(alice, "prototype.png", png.getvalue())
-    contract = v.store(alice, "contract.pdf", pdf.getvalue())
+    contract = v.store(alice, "contract.pdf", pdf.getvalue(), ["password"], "contract-password")
     v.share(plan, alice, "bob@gmail.com", "view")
     v.share(logo, alice, "bob@gmail.com", "view")
     v.share(contract, alice, "bob@gmail.com", "download")
     print("demo accounts: alice@gmail.com / alice-password, bob@gmail.com / bob-password, eve@gmail.com / eve-password")
+    print("file passwords: launch-plan.txt / launch-password, contract.pdf / contract-password")
 
 
 def main(argv=None):

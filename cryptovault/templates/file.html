@@ -5,14 +5,18 @@
   <div class="row" style="justify-content:space-between">
     <div>
       <h1>{{ meta.name }}</h1>
-      <p class="small muted" style="margin:0">{{ meta.size | size }} · {{ meta.type }} · owned by {{ meta.owner }} · locked {{ meta.created | when }}</p>
+      <p class="small muted" style="margin:0 0 6px">{{ meta.size | size }} · {{ meta.type }} · owned by {{ meta.owner }} · locked {{ meta.created | when }}</p>
+      {% for l in info.header.layers %}<span class="badge ok">{{ LAYER_NAMES[l] }}</span> {% endfor %}
     </div>
     <div class="actions">
-      {% if perm in ("owner", "download") %}<a class="btn primary" href="/file/{{ fid }}/download">Download original</a>{% endif %}
+      {% if perm in ("owner", "download") and "lockdown" not in info.header.layers %}<a class="btn primary" href="/file/{{ fid }}/download">Download original</a>{% endif %}
       <a class="btn" href="/file/{{ fid }}/locked">Download locked copy</a>
     </div>
   </div>
-  {% if perm == "view" %}
+  {% if "lockdown" in info.header.layers %}
+    <p class="small muted" style="margin:12px 0 0">Locked down: view-only for everyone, the owner included. Not even a stolen
+    login can download the original.</p>
+  {% elif perm == "view" %}
     <p class="small muted" style="margin:12px 0 0">View only. The owner hasn't allowed downloading the original. A locked copy
     opens only inside CryptoVault, and only while you still have access.</p>
   {% endif %}
@@ -47,10 +51,13 @@
   {% else %}
     <p class="muted">Only you can open this file.</p>
   {% endif %}
+  {% if "password" in info.header.layers %}
+    <p class="small muted">This file has a password: people you share with also need it. Tell them in person, not in the same message.</p>
+  {% endif %}
   <form class="share-form" method="post" action="/file/{{ fid }}/share" style="margin-top:16px">
     <div><label for="s-email">Share with email</label><input type="email" id="s-email" name="email" placeholder="friend@gmail.com" required></div>
     <div><label for="s-perm">Permission</label>
-      <select id="s-perm" name="perm"><option value="view">View only</option><option value="download">View + download</option></select></div>
+      <select id="s-perm" name="perm"><option value="view">View only</option>{% if "lockdown" not in info.header.layers %}<option value="download">View + download</option>{% endif %}</select></div>
     <div><label for="s-until">Expires (optional)</label><input type="date" id="s-until" name="until"></div>
     <button class="primary">Share</button>
   </form>
@@ -84,13 +91,15 @@
     <label>File <code>{{ info.file }}</code> ({{ info.disk_size }} bytes on disk). The name, owner and access list are not visible.</label>
     <pre>file_id      {{ info.header.file_id }}
 nonce_prefix {{ info.header.nonce_prefix }}
-wrapped_key  {{ info.header.wrapped_key[:72] }}…   (RSA-OAEP with the system public key)</pre>
+wrapped_key  {{ info.header.wrapped_key[:72] }}…   (RSA-OAEP with the system public key)
+layers       {{ info.header.layers | join(", ") }}   (part of the AAD, so no layer can be stripped)
+kdf          {{ info.header.kdf or "none (no password layer)" }}</pre>
     <label>Sealed metadata: name, owner, access list ({{ info.sealed_meta | length }} bytes, AES-256-GCM)</label>
     <pre>{{ info.sealed_meta[:48].hex() }}…</pre>
-    <label>Data: {{ info.segments }} STREAM segment{{ "s" if info.segments != 1 }}, {{ info.data_len }} bytes (AES-256-GCM, 16-byte tag each)</label>
+    <label>Data: {{ info.segments }} STREAM segment{{ "s" if info.segments != 1 }}, {{ info.data_len }} bytes (AES-256-GCM, 16-byte tag each{% if "cascade" in info.header.layers %}, wrapping a ChaCha20-Poly1305 layer{% endif %})</label>
     <pre>{{ info.data_head.hex() }}…</pre>
     <label>Integrity</label>
-    <pre>sha256  {{ meta.sha256 }}</pre>
+    <pre>digest  {{ meta.digest }}   (HMAC-SHA256 under a key derived from the content key)</pre>
   </div>
 </details>
 {% endblock %}

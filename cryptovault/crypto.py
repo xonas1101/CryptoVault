@@ -8,6 +8,7 @@ in one place. Nothing here touches the filesystem.
   key wrapping     RSA-3072-OAEP-SHA256 encrypts each file's random key (the "hybrid" part)
   key separation   HKDF-SHA256 derives independent keys from one secret
   streaming AEAD   AES-256-GCM in the STREAM construction, for files of any size
+  cascade          optional inner ChaCha20-Poly1305 layer, so one broken cipher isn't enough
   integrity tags   HMAC-SHA256 for the user table and the audit log hash chain
 """
 import base64
@@ -20,7 +21,7 @@ import struct
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
@@ -54,29 +55,34 @@ def canon(obj) -> bytes:
 
 # ---------- single-shot AEAD ----------
 
-def seal(key: bytes, plaintext: bytes, aad: bytes) -> bytes:
-    """AES-256-GCM with a fresh random nonce, returned as nonce || ciphertext || tag."""
+def seal(key: bytes, plaintext: bytes, aad: bytes, aead=AESGCM) -> bytes:
+    """AES-256-GCM (or ChaCha20-Poly1305) with a fresh random nonce, returned as nonce || ciphertext || tag."""
     nonce = os.urandom(12)
-    return nonce + AESGCM(key).encrypt(nonce, plaintext, aad)
+    return nonce + aead(key).encrypt(nonce, plaintext, aad)
 
 
-def unseal(key: bytes, sealed: bytes, aad: bytes, what: str) -> bytes:
+def unseal(key: bytes, sealed: bytes, aad: bytes, what: str, aead=AESGCM) -> bytes:
     try:
-        return AESGCM(key).decrypt(sealed[:12], sealed[12:], aad)
+        return aead(key).decrypt(sealed[:12], sealed[12:], aad)
     except (InvalidTag, ValueError):
         raise CryptoError(f"{what} failed authentication (tampered or wrong key)") from None
 
 
 # ---------- passwords ----------
 
-def _scrypt(password: str, kdf: dict) -> bytes:
+def new_kdf() -> dict:
+    return {"salt": b64e(os.urandom(16)), **SCRYPT}
+
+
+def password_key(password: str, kdf: dict) -> bytes:
+    """scrypt: password -> 32-byte key. Slow and memory-hard, so every guess is expensive."""
     return Scrypt(salt=b64d(kdf["salt"]), length=32, n=kdf["n"], r=kdf["r"], p=kdf["p"]).derive(password.encode())
 
 
 def hash_password(password: str) -> dict:
     """Slow, salted, memory-hard hash. The server stores this, never the password."""
-    kdf = {"salt": b64e(os.urandom(16)), **SCRYPT}
-    return {"kdf": kdf, "hash": b64e(_scrypt(password, kdf))}
+    kdf = new_kdf()
+    return {"kdf": kdf, "hash": b64e(password_key(password, kdf))}
 
 
 DUMMY_HASH = hash_password("timing-equaliser")
@@ -85,18 +91,18 @@ DUMMY_HASH = hash_password("timing-equaliser")
 def check_password(record: dict | None, password: str) -> bool:
     # Unknown users are checked against a dummy hash, so response time doesn't reveal which emails have accounts.
     record = record or DUMMY_HASH
-    return hmac.compare_digest(_scrypt(password, record["kdf"]), b64d(record["hash"])) and record is not DUMMY_HASH
+    return hmac.compare_digest(password_key(password, record["kdf"]), b64d(record["hash"])) and record is not DUMMY_HASH
 
 
 def seal_secrets(secrets: dict, passphrase: str) -> dict:
     """Encrypt a dict of byte strings under a passphrase. The KDF parameters are the AAD, so they can't be quietly weakened."""
-    kdf = {"salt": b64e(os.urandom(16)), **SCRYPT}
+    kdf = new_kdf()
     body = canon({k: b64e(v) for k, v in secrets.items()})
-    return {"kdf": kdf, "sealed": b64e(seal(_scrypt(passphrase, kdf), body, canon(kdf)))}
+    return {"kdf": kdf, "sealed": b64e(seal(password_key(passphrase, kdf), body, canon(kdf)))}
 
 
 def open_secrets(store: dict, passphrase: str) -> dict:
-    body = unseal(_scrypt(passphrase, store["kdf"]), b64d(store["sealed"]), canon(store["kdf"]), "master key (wrong passphrase?)")
+    body = unseal(password_key(passphrase, store["kdf"]), b64d(store["sealed"]), canon(store["kdf"]), "master key (wrong passphrase?)")
     return {k: b64d(v) for k, v in json.loads(body).items()}
 
 

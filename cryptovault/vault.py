@@ -7,17 +7,27 @@
       audit.log           tamper-evident access log (HMAC hash chain)
       files/<id>.cvault   encrypted files
 
-.cvault layout (version 3):
-    "CVLT3" | u32 len | header (JSON) | u32 len | sealed metadata | STREAM segments...
+.cvault layout (version 4):
+    "CVLT4" | u32 len | header (JSON) | u32 len | sealed metadata | STREAM segments...
 
-    header   = {file_id, nonce_prefix, wrapped_key: RSA-OAEP(system public key, file_key)}
-    metadata = {name, size, sha256, type, owner, created, shares: {email: {perm, until}}}
+    header   = {file_id, nonce_prefix, wrapped_key: RSA-OAEP(system public key, file_key),
+                layers: the protection layers the owner picked, kdf: scrypt params or null}
+    metadata = {name, size, digest, check?, type, owner, created, shares: {email: {perm, until}}}
 
 The whole header is the AAD for every AES-GCM call. The metadata, including the access
 list, is encrypted and authenticated, so nobody can grant themselves access by editing
 files on disk. Sharing re-seals only the metadata; the data segments are never touched.
+
+Protection layers (each file picks its own; at least one of the first two holds the key):
+    system    the content key comes from file_key, so the server can open the file by itself
+    password  the content key also needs scrypt(file password); without it nobody, not even
+              the server, can read the content. With both, BOTH are needed.
+    cascade   the data is first encrypted with ChaCha20-Poly1305, then with AES-256-GCM,
+              under independent keys: breaking one cipher is not enough
+    lockdown  view-only for everyone, owner included: the original can never be downloaded
+The metadata is always sealed under file_key, so the server can still list files and enforce
+access lists. The layer list sits in the authenticated header, so it can't be stripped.
 """
-import hashlib
 import io
 import json
 import mimetypes
@@ -36,10 +46,11 @@ from . import crypto
 from .audit import AuditLog
 from .crypto import CHUNK, TAG, CryptoError, b64d, b64e, canon
 
-MAGIC = b"CVLT3"
+MAGIC = b"CVLT4"
 EMAIL_RE = re.compile(r"[a-z0-9._%+-]+@[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,}")
 ID_RE = re.compile(r"[0-9a-f]{32}")
-HEADER_KEYS = {"file_id", "nonce_prefix", "wrapped_key"}
+HEADER_KEYS = {"file_id", "nonce_prefix", "wrapped_key", "layers", "kdf"}
+LAYERS = ("system", "password", "cascade", "lockdown")
 PERMS = ("view", "download")
 MAX_BLOCK = 1 << 20  # sanity limit on header/metadata size, checked before trusting a length field
 
@@ -50,6 +61,10 @@ class VaultError(Exception):
 
 class AccessDenied(VaultError):
     pass
+
+
+class PasswordRequired(AccessDenied):
+    """The file has a password layer and no unlocked key was supplied."""
 
 
 def normalize_email(email: str) -> str:
@@ -65,7 +80,7 @@ class OpenFile:
     stream: object    # file object positioned at the first data segment
     header: dict
     meta: dict        # decrypted, authenticated metadata
-    data_key: bytes
+    file_key: bytes
     meta_key: bytes
     perm: str = ""    # caller's permission: owner, download or view
 
@@ -102,7 +117,8 @@ def _read_container(f):
         header = json.loads(_read_block(f))
     except ValueError:
         raise VaultError("corrupted file (bad header)") from None
-    if not isinstance(header, dict) or set(header) != HEADER_KEYS or not ID_RE.fullmatch(str(header["file_id"])):
+    if (not isinstance(header, dict) or set(header) != HEADER_KEYS or not ID_RE.fullmatch(str(header["file_id"]))
+            or not isinstance(header["layers"], list) or not set(header["layers"]) <= set(LAYERS)):
         raise VaultError("corrupted file (bad header)")
     return header, _read_block(f)
 
@@ -194,28 +210,49 @@ class Vault:
 
     # ---------- storing ----------
 
-    def _subkeys(self, file_key: bytes, header: dict):
-        """Independent keys for the data and the metadata, so the two can never collide on a nonce."""
-        salt = bytes.fromhex(header["file_id"])
-        return crypto.derive(file_key, "data", salt), crypto.derive(file_key, "metadata", salt)
+    @staticmethod
+    def _meta_key(file_key: bytes, header: dict) -> bytes:
+        return crypto.derive(file_key, "metadata", bytes.fromhex(header["file_id"]))
 
-    def store(self, owner: str, name: str, data: bytes) -> str:
+    @staticmethod
+    def _content_keys(file_key: bytes, header: dict, pw_key: bytes | None) -> dict:
+        """Independent keys for each job, derived from whichever secrets the file's layers name.
+        Both secrets are exactly 32 bytes, so their concatenation is unambiguous."""
+        layers = header["layers"]
+        ikm = (file_key if "system" in layers else b"") + ((pw_key or b"") if "password" in layers else b"")
+        salt = bytes.fromhex(header["file_id"])
+        return {label: crypto.derive(ikm, label, salt) for label in ("data", "cascade", "digest", "check")}
+
+    def store(self, owner: str, name: str, data: bytes, layers=("system",), password: str | None = None) -> str:
         """Hybrid encryption: a fresh random key encrypts the data; RSA wraps that key.
         Only the system PUBLIC key is used here: encrypting never needs the private key."""
+        layers = [x for x in LAYERS if x in layers]  # canonical order, unknown names dropped
+        if not {"system", "password"} & set(layers):
+            raise VaultError("pick the server key, a password, or both: something has to hold the key")
+        if "password" in layers and len(password or "") < 8:
+            raise VaultError("the file password must be at least 8 characters")
+        kdf = crypto.new_kdf() if "password" in layers else None
         name = Path(name).name or "unnamed"
-        meta = {"name": name, "size": len(data), "sha256": hashlib.sha256(data).hexdigest(),
-                "type": mimetypes.guess_type(name)[0] or "application/octet-stream",
-                "owner": owner, "created": int(time.time()), "shares": {}}
         file_key = os.urandom(32)
         header = {"file_id": os.urandom(16).hex(), "nonce_prefix": b64e(os.urandom(crypto.PREFIX)),
-                  "wrapped_key": b64e(crypto.wrap_key(file_key, self._public))}
+                  "wrapped_key": b64e(crypto.wrap_key(file_key, self._public)), "layers": layers, "kdf": kdf}
         aad = _aad(header)
-        data_key, meta_key = self._subkeys(file_key, header)
+        keys = self._content_keys(file_key, header, kdf and crypto.password_key(password, kdf))
+        # a keyed digest, not a plain SHA-256: the server can read metadata, and a plain hash
+        # would let it confirm guesses about the content of a password-only file
+        meta = {"name": name, "size": len(data), "digest": crypto.mac(keys["digest"], data),
+                "type": mimetypes.guess_type(name)[0] or "application/octet-stream",
+                "owner": owner, "created": int(time.time()), "shares": {}}
+        if kdf:
+            meta["check"] = crypto.mac(keys["check"], b"password check")
+        if "cascade" in layers:
+            data = crypto.seal(keys["cascade"], data, aad, crypto.ChaCha20Poly1305)
+        data_key, meta_key = keys["data"], self._meta_key(file_key, header)
         chunks = (data[i:i + CHUNK] for i in range(0, len(data), CHUNK))
         segments = crypto.encrypt_stream(data_key, b64d(header["nonce_prefix"]), aad, chunks)
         _write_atomic(self._path(header["file_id"]),
                       chain([MAGIC, _block(canon(header)), _block(crypto.seal(meta_key, canon(meta), aad))], segments), 0o644)
-        self.audit.append(owner, "upload", header["file_id"], name)
+        self.audit.append(owner, "upload", header["file_id"], f"{name} [{', '.join(layers)}]")
         return header["file_id"]
 
     # ---------- opening ----------
@@ -235,9 +272,9 @@ class Vault:
             if header["file_id"] != fid:
                 raise CryptoError("file was swapped with another file")
             file_key = crypto.unwrap_key(b64d(header["wrapped_key"]), self._private)
-            data_key, meta_key = self._subkeys(file_key, header)
+            meta_key = self._meta_key(file_key, header)
             meta = json.loads(crypto.unseal(meta_key, sealed_meta, _aad(header), "metadata"))
-            yield OpenFile(path, f, header, meta, data_key, meta_key)
+            yield OpenFile(path, f, header, meta, file_key, meta_key)
 
     def _permission(self, meta: dict, user: str) -> str:
         if user == meta["owner"]:
@@ -257,6 +294,8 @@ class Vault:
                 o.perm = self._permission(o.meta, user)
                 if need == "owner" and o.perm != "owner":
                     raise AccessDenied("only the owner can do that")
+                if need == "download" and "lockdown" in o.header["layers"]:
+                    raise AccessDenied("this file is locked down: view-only for everyone, owner included")
                 if need == "download" and o.perm == "view":
                     raise AccessDenied("the owner allowed viewing only, not downloading")
             except AccessDenied as e:
@@ -264,11 +303,16 @@ class Vault:
                 raise
             yield o
 
-    def _plaintext(self, o: OpenFile) -> bytes:
+    def _plaintext(self, o: OpenFile, pw_key: bytes | None) -> bytes:
+        if "password" in o.header["layers"] and not pw_key:
+            raise PasswordRequired(f"{o.meta['name']} is password-locked")
+        keys, aad = self._content_keys(o.file_key, o.header, pw_key), _aad(o.header)
         # ponytail: whole file in memory; the web UI caps uploads at 100 MB, so this is bounded
-        data = b"".join(crypto.decrypt_stream(o.data_key, b64d(o.header["nonce_prefix"]), _aad(o.header), o.stream))
-        if len(data) != o.meta["size"] or hashlib.sha256(data).hexdigest() != o.meta["sha256"]:
-            raise CryptoError("content does not match its recorded SHA-256")
+        data = b"".join(crypto.decrypt_stream(keys["data"], b64d(o.header["nonce_prefix"]), aad, o.stream))
+        if "cascade" in o.header["layers"]:
+            data = crypto.unseal(keys["cascade"], data, aad, "inner ChaCha20-Poly1305 layer", crypto.ChaCha20Poly1305)
+        if len(data) != o.meta["size"] or not crypto.mac_ok(keys["digest"], data, o.meta["digest"]):
+            raise CryptoError("content does not match its recorded digest")
         return data
 
     def _reseal(self, o: OpenFile):
@@ -289,7 +333,7 @@ class Vault:
             except (VaultError, CryptoError):
                 broken.append(path.stem)
                 continue
-            row = {"id": path.stem, **meta}
+            row = {"id": path.stem, **meta, "layers": o.header["layers"]}
             if meta["owner"] == user:
                 mine.append(row)
             elif user in meta["shares"]:
@@ -298,10 +342,23 @@ class Vault:
         newest = lambda r: -r["created"]
         return sorted(mine, key=newest), sorted(shared, key=newest), broken
 
-    def read(self, fid: str, user: str, action: str | None = "view"):
-        """Decrypt for a user. action is what gets logged: "view", "download", or None (e.g. extra preview pages)."""
+    def unlock_file(self, fid: str, user: str, password: str) -> bytes:
+        """Check a file password and return the key derived from it, for passing to read()."""
+        with self._access(fid, user) as o:
+            if "password" not in o.header["layers"]:
+                raise VaultError("this file has no password")
+            pw_key = crypto.password_key(password, o.header["kdf"])
+            # ponytail: no rate limit; scrypt makes each guess cost ~50 ms and every miss is logged
+            if not crypto.mac_ok(self._content_keys(o.file_key, o.header, pw_key)["check"], b"password check", o.meta["check"]):
+                self.audit.append(user, "denied", fid, "wrong file password")
+                raise AccessDenied("wrong file password")
+            return pw_key
+
+    def read(self, fid: str, user: str, action: str | None = "view", pw_key: bytes | None = None):
+        """Decrypt for a user. action is what gets logged: "view", "download", or None (e.g. extra preview pages).
+        Password-locked files also need pw_key, from unlock_file()."""
         with self._access(fid, user, need="download" if action == "download" else None) as o:
-            data = self._plaintext(o)
+            data = self._plaintext(o, pw_key)
             if action:
                 self.audit.append(user, action, fid)
             return data, o.meta, o.perm
@@ -330,6 +387,8 @@ class Vault:
         with self.lock, self._access(fid, owner, need="owner") as o:
             if email == owner:
                 raise VaultError("you already own this file")
+            if perm == "download" and "lockdown" in o.header["layers"]:
+                raise VaultError("this file is locked down: it can only be shared view-only")
             o.meta["shares"][email] = {"perm": perm, "until": until}
             self._reseal(o)
         detail = f"{email}: {perm}" + (time.strftime(", until %d %b %Y", time.localtime(until)) if until else "")

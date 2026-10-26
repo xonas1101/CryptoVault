@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block header %}<a class="btn" href="/">← All files</a>{% endblock %}
+{% block body %}
+<form class="card" method="post" action="/file/{{ fid }}/unlock" style="max-width:440px;margin:40px auto">
+  <h1>🔑 {{ message }}</h1>
+  <p class="small muted">The key is derived from this password with scrypt. The server never stores it, so without it nobody can
+  read the content. It stays unlocked until you log out.</p>
+  <input type="password" name="password" placeholder="File password" autocomplete="current-password" autofocus required>
+  <button class="primary">Unlock</button>
+</form>
+{% endblock %}

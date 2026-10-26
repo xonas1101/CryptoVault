@@ -33,8 +33,9 @@ class WebTest(unittest.TestCase):
         c.post("/login", data={"email": email, "password": email.split("@")[0] + "-password"})
         return c
 
-    def upload(self, c, name, data):
-        r = c.post("/upload", data={"file": (io.BytesIO(data), name)}, content_type="multipart/form-data")
+    def upload(self, c, name, data, layers=("system",), password=""):
+        r = c.post("/upload", data={"file": (io.BytesIO(data), name), "layer": list(layers), "password": password,
+                                    "confirm": password}, content_type="multipart/form-data")
         return r.headers["Location"].rsplit("/", 1)[1]  # redirected to /file/<id>
 
     def share(self, c, fid, email, perm="view", until=""):
@@ -107,6 +108,19 @@ class WebTest(unittest.TestCase):
         for c in (self.app.test_client(), self.login(EVE)):
             for url in (f"/file/{fid}", f"/file/{fid}/download", f"/file/{fid}/locked", f"/file/{fid}/page/0.png"):
                 self.assertNotIn(b"TOP SECRET", c.get(url, follow_redirects=True).data)
+
+    def test_password_locked_file(self):
+        alice, bob = self.login(ALICE), self.login(BOB)
+        fid = self.upload(alice, "pin.txt", b"vault pin 4242", ["password", "cascade"], "file-password")
+        self.share(alice, fid, BOB, "download")
+        self.assertIn(b"password-locked", bob.get(f"/file/{fid}").data)
+        self.assertNotIn(b"4242", bob.get(f"/file/{fid}/download", follow_redirects=True).data)
+        page = bob.post(f"/file/{fid}/unlock", data={"password": "wrong-password"}, follow_redirects=True).data
+        self.assertIn(b"wrong file password", page)
+        bob.post(f"/file/{fid}/unlock", data={"password": "file-password"})
+        self.assertIn(b"vault pin 4242", bob.get(f"/file/{fid}").data)
+        self.assertEqual(bob.get(f"/file/{fid}/download").data, b"vault pin 4242")
+        self.assertIn(b"password-locked", alice.get(f"/file/{fid}").data)  # unlocking is per person and session
 
     def test_filenames_are_html_escaped(self):
         alice = self.login(ALICE)
