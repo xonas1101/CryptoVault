@@ -10,6 +10,9 @@ in one place. Nothing here touches the filesystem.
   streaming AEAD   AES-256-GCM in the STREAM construction, for files of any size
   cascade          optional inner ChaCha20-Poly1305 layer, so one broken cipher isn't enough
   integrity tags   HMAC-SHA256 for the user table and the audit log hash chain
+  signatures       Ed25519: each user signs what they upload
+  sealed boxes     X25519 + HKDF + AES-GCM: encrypt to one user's public key
+  secret sharing   Shamir k-of-n over GF(2^521 - 1), for the approval-quorum layer
 """
 import base64
 import hashlib
@@ -17,10 +20,11 @@ import hmac
 import json
 import os
 import struct
+from secrets import randbelow
 
-from cryptography.exceptions import InvalidTag
+from cryptography.exceptions import InvalidSignature, InvalidTag
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.hazmat.primitives.asymmetric import ed25519, padding, rsa, x25519
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
@@ -193,3 +197,81 @@ def decrypt_stream(key: bytes, prefix: bytes, aad: bytes, src):
         if not nxt:
             return
         counter, seg = counter + 1, nxt
+
+
+# ---------- user key pairs: Ed25519 signatures and X25519 sealed boxes ----------
+
+def new_user_keys() -> dict:
+    """Raw 32-byte private keys: "sign" (Ed25519) and "box" (X25519, for receiving sealed boxes)."""
+    return {"sign": ed25519.Ed25519PrivateKey.generate().private_bytes_raw(),
+            "box": x25519.X25519PrivateKey.generate().private_bytes_raw()}
+
+
+def public_keys(keys: dict) -> dict:
+    return {"sign": b64e(ed25519.Ed25519PrivateKey.from_private_bytes(keys["sign"]).public_key().public_bytes_raw()),
+            "box": b64e(x25519.X25519PrivateKey.from_private_bytes(keys["box"]).public_key().public_bytes_raw())}
+
+
+def sign(private: bytes, data: bytes) -> str:
+    return b64e(ed25519.Ed25519PrivateKey.from_private_bytes(private).sign(data))
+
+
+def verify(public: str, data: bytes, signature: str) -> bool:
+    try:
+        ed25519.Ed25519PublicKey.from_public_bytes(b64d(public)).verify(b64d(signature), data)
+        return True
+    except InvalidSignature:
+        return False
+
+
+def fingerprint(public: str) -> str:
+    """Short, human-comparable form of a public key."""
+    h = hashlib.sha256(b64d(public)).hexdigest()[:20]
+    return " ".join(h[i:i + 4] for i in range(0, 20, 4))
+
+
+def _box_key(shared: bytes, eph: bytes, recipient: bytes) -> bytes:
+    return derive(shared, "sealed box", eph + recipient)  # both public keys as salt bind the key to this exchange
+
+
+def seal_to(public: str, plaintext: bytes, aad: bytes) -> dict:
+    """Sealed box (ECIES): a fresh ephemeral X25519 key agrees a secret with the recipient's
+    public key, HKDF turns it into an AES key. Only the recipient's private key can open it."""
+    eph, recipient = x25519.X25519PrivateKey.generate(), b64d(public)
+    eph_pub = eph.public_key().public_bytes_raw()
+    key = _box_key(eph.exchange(x25519.X25519PublicKey.from_public_bytes(recipient)), eph_pub, recipient)
+    return {"eph": b64e(eph_pub), "box": b64e(seal(key, plaintext, aad))}
+
+
+def open_box(private: bytes, box: dict, aad: bytes) -> bytes:
+    me, eph = x25519.X25519PrivateKey.from_private_bytes(private), b64d(box["eph"])
+    key = _box_key(me.exchange(x25519.X25519PublicKey.from_public_bytes(eph)), eph, me.public_key().public_bytes_raw())
+    return unseal(key, b64d(box["box"]), aad, "sealed box")
+
+
+# ---------- Shamir secret sharing ----------
+
+SHAMIR_P = 2**521 - 1  # a Mersenne prime, comfortably larger than a 256-bit secret
+
+
+def split(secret: bytes, k: int, n: int) -> list:
+    """Hide the secret in f(0) of a random polynomial of degree k-1; share x is (x, f(x)).
+    Any k points fix the polynomial. Any k-1 points fit EVERY possible secret equally well,
+    so they reveal nothing at all (information-theoretic, not just computationally hard)."""
+    coeffs = [int.from_bytes(secret, "big")] + [randbelow(SHAMIR_P) for _ in range(k - 1)]
+    return [(x, sum(c * pow(x, i, SHAMIR_P) for i, c in enumerate(coeffs)) % SHAMIR_P) for x in range(1, n + 1)]
+
+
+def combine(shares) -> bytes:
+    """Lagrange interpolation at x = 0 recovers f(0)."""
+    secret = 0
+    for xi, yi in shares:
+        num = den = 1
+        for xj, _ in shares:
+            if xj != xi:
+                num = num * -xj % SHAMIR_P
+                den = den * (xi - xj) % SHAMIR_P
+        secret = (secret + yi * num * pow(den, -1, SHAMIR_P)) % SHAMIR_P
+    if secret.bit_length() > 256:
+        raise CryptoError("shares don't combine to a valid secret (too few, or wrong ones)")
+    return secret.to_bytes(32, "big")

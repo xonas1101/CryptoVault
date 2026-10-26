@@ -26,8 +26,9 @@ def seed(v: Vault):
     if v.has_users():
         print("demo: vault already has users, not seeding")
         return
-    for name in ("alice", "bob", "eve"):
+    for name in ("alice", "bob", "carol", "eve"):
         v.register(f"{name}@gmail.com", f"{name}-password")
+    signer = v.user_keys("alice@gmail.com", "alice-password")["sign"]
 
     font = ImageFont.load_default(size=36)
     img = Image.new("RGB", (900, 560), "#1f2a44")
@@ -48,14 +49,18 @@ def seed(v: Vault):
     alice = "alice@gmail.com"
     # one file per protection level: everything, server key only, password only
     plan = v.store(alice, "launch-plan.txt", b"Q3 launch plan\n\n1. Ship on 1 Dec\n2. Do not tell anyone\n",
-                   ["system", "password", "cascade", "lockdown"], "launch-password")
-    logo = v.store(alice, "prototype.png", png.getvalue())
-    contract = v.store(alice, "contract.pdf", pdf.getvalue(), ["password"], "contract-password")
+                   ["system", "password", "cascade", "lockdown"], "launch-password", signer=signer)
+    logo = v.store(alice, "prototype.png", png.getvalue(), signer=signer)
+    contract = v.store(alice, "contract.pdf", pdf.getvalue(), ["password"], "contract-password", signer=signer)
+    board = v.store(alice, "board-minutes.txt", b"Board minutes\n\nThe acquisition of Initech is approved.\n",
+                    ["system", "quorum"], signer=signer, approvers=["bob@gmail.com", "carol@gmail.com"], threshold=2)
     v.share(plan, alice, "bob@gmail.com", "view")
     v.share(logo, alice, "bob@gmail.com", "view")
     v.share(contract, alice, "bob@gmail.com", "download")
-    print("demo accounts: alice@gmail.com / alice-password, bob@gmail.com / bob-password, eve@gmail.com / eve-password")
+    v.share(board, alice, "bob@gmail.com", "view")
+    print("demo accounts: alice, bob, carol, eve @gmail.com, password <name>-password (e.g. alice-password)")
     print("file passwords: launch-plan.txt / launch-password, contract.pdf / contract-password")
+    print("board-minutes.txt needs approval from bob and carol before anyone can open it")
 
 
 def main(argv=None):
@@ -64,12 +69,17 @@ def main(argv=None):
     p.add_argument("--host", default="127.0.0.1", help="default 127.0.0.1 (this machine only)")
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--demo", action="store_true", help="create demo accounts and sample files in an empty vault")
+    p.add_argument("--rotate-key", action="store_true", help="replace the system RSA key, re-wrap every file key, and exit")
     args = p.parse_args(argv)
 
     v = Vault(args.vault)
     try:
         if v.initialized():
-            v.unlock(ask("Master passphrase: "))
+            passphrase = ask("Master passphrase: ")
+            v.unlock(passphrase)
+            if args.rotate_key:
+                print(f"new system key in place; {v.rotate_key(passphrase)} file keys re-wrapped; the old key is destroyed")
+                return
         else:
             print(f"Creating a new vault in {args.vault}/")
             v.initialize(ask("Choose a master passphrase (12+ characters): ", confirm=True))

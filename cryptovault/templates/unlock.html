@@ -2,10 +2,20 @@
 {% block header %}<a class="btn" href="/">← All files</a>{% endblock %}
 {% block body %}
 <form class="card" method="post" action="/file/{{ fid }}/unlock" style="max-width:440px;margin:40px auto">
+  {% if quorum %}
+  <h1>🗳 {{ message }}</h1>
+  <p class="small muted">Part of this file's key was split between several people with Shamir's secret sharing. It opens once
+  {{ quorum.k }} of them approve on their dashboard. Until then nobody, not even the server, can decrypt it.</p>
+  {% for email, until in quorum.approvers.items() %}
+    <p style="margin:0 0 4px">{{ "✓" if until else "…" }} {{ email }}{% if until %} <span class="small muted">until {{ until | clock }}</span>{% endif %}</p>
+  {% endfor %}
+  <a class="btn" href="/file/{{ fid }}" style="margin-top:12px">Check again</a>
+  {% else %}
   <h1>🔑 {{ message }}</h1>
   <p class="small muted">The key is derived from this password with scrypt. The server never stores it, so without it nobody can
   read the content. It stays unlocked until you log out.</p>
   <input type="password" name="password" placeholder="File password" autocomplete="current-password" autofocus required>
   <button class="primary">Unlock</button>
+  {% endif %}
 </form>
 {% endblock %}

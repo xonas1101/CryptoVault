@@ -33,9 +33,9 @@ class WebTest(unittest.TestCase):
         c.post("/login", data={"email": email, "password": email.split("@")[0] + "-password"})
         return c
 
-    def upload(self, c, name, data, layers=("system",), password=""):
+    def upload(self, c, name, data, layers=("system",), password="", **extra):
         r = c.post("/upload", data={"file": (io.BytesIO(data), name), "layer": list(layers), "password": password,
-                                    "confirm": password}, content_type="multipart/form-data")
+                                    "confirm": password, **extra}, content_type="multipart/form-data")
         return r.headers["Location"].rsplit("/", 1)[1]  # redirected to /file/<id>
 
     def share(self, c, fid, email, perm="view", until=""):
@@ -121,6 +121,22 @@ class WebTest(unittest.TestCase):
         self.assertIn(b"vault pin 4242", bob.get(f"/file/{fid}").data)
         self.assertEqual(bob.get(f"/file/{fid}/download").data, b"vault pin 4242")
         self.assertIn(b"password-locked", alice.get(f"/file/{fid}").data)  # unlocking is per person and session
+
+    def test_quorum_signature_and_shred(self):
+        alice, bob, eve = self.login(ALICE), self.login(BOB), self.login(EVE)
+        fid = self.upload(alice, "board.txt", b"merger approved", ["system", "quorum"],
+                          approvers=f"{BOB}, {EVE}", threshold="2")
+        self.assertIn(b"needs 2 of 2 approvals", alice.get(f"/file/{fid}").data)
+        self.assertIn(b"Waiting for your approval", bob.get("/").data)
+        bob.post(f"/file/{fid}/approve")
+        self.assertIn(b"1 so far", alice.get(f"/file/{fid}").data)
+        eve.post(f"/file/{fid}/approve")
+        page = alice.get(f"/file/{fid}").data
+        self.assertIn(b"merger approved", page)
+        self.assertIn(b"Signed by alice@gmail.com", page)
+        self.assertNotIn(b"merger approved", eve.get(f"/file/{fid}").data)  # approving isn't access
+        self.assertIn(b"undecryptable", alice.post(f"/file/{fid}/delete", follow_redirects=True).data)
+        self.assertIn(b"no longer exists", alice.get(f"/file/{fid}", follow_redirects=True).data)
 
     def test_filenames_are_html_escaped(self):
         alice = self.login(ALICE)

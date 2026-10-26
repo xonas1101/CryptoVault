@@ -14,7 +14,7 @@ from flask import Flask, abort, flash, redirect, render_template, request, send_
 
 from . import preview
 from .crypto import CryptoError
-from .vault import AccessDenied, PasswordRequired, Vault, VaultError
+from .vault import AccessDenied, PasswordRequired, QuorumRequired, Vault, VaultError
 
 IDLE_TIMEOUT = 15 * 60
 MAX_UPLOAD = 100 * 1024 * 1024
@@ -30,7 +30,8 @@ def create_app(vault: Vault):
     )
     v = vault
     # ponytail: in-process session table, so this works with a single server process only
-    sessions = {}  # random token -> {"user", "seen", "keys": {file id: password-derived key}}
+    # random token -> {"user", "seen", "me": the user's unsealed private keys, "keys": {file id: password-derived key}}
+    sessions = {}
 
     def current():
         token = session.get("token")
@@ -42,10 +43,14 @@ def create_app(vault: Vault):
         session.pop("token", None)  # not session.clear(): that would also wipe pending flash messages
         return None
 
-    def start(user):
+    def start(user, password):
         token = secrets.token_urlsafe(32)  # fresh token on every login, which prevents session fixation
-        sessions[token] = {"user": user, "seen": time.time(), "keys": {}}
+        # the private keys are unsealed with the login password and held only while the session lives
+        sessions[token] = {"user": user, "seen": time.time(), "me": v.user_keys(user, password), "keys": {}}
         session["token"] = token
+
+    def my_keys():
+        return sessions[session["token"]]["me"]
 
     def key_for(fid):
         # ponytail: unlocked file keys live in server memory until logout or idle timeout, so each
@@ -79,11 +84,15 @@ def create_app(vault: Vault):
         return resp
 
     app.jinja_env.globals["LAYER_NAMES"] = {"system": "server key", "password": "password",
-                                            "cascade": "double encryption", "lockdown": "lockdown"}
+                                            "quorum": "approval quorum", "cascade": "double encryption", "lockdown": "lockdown"}
 
     @app.template_filter("when")
     def when(ts):
         return datetime.fromtimestamp(ts).strftime("%d %b %Y, %H:%M") if ts else "never"
+
+    @app.template_filter("clock")
+    def clock(ts):
+        return datetime.fromtimestamp(ts).strftime("%H:%M")
 
     @app.template_filter("day")
     def day(ts):
@@ -104,24 +113,27 @@ def create_app(vault: Vault):
         user = current()
         if not user:
             return render_template("login.html")
-        mine, shared, broken = v.files_for(user)
-        return render_template("dashboard.html", user=user, mine=mine, shared=shared, broken=broken)
+        mine, shared, broken, approvals = v.files_for(user)
+        return render_template("dashboard.html", user=user, mine=mine, shared=shared, broken=broken,
+                               approvals=approvals, fingerprint=v.fingerprint(user))
 
     @app.post("/login")
     def login():
         try:
-            start(v.authenticate(request.form.get("email", ""), request.form.get("password", "")))
+            password = request.form.get("password", "")
+            start(v.authenticate(request.form.get("email", ""), password), password)
         except AccessDenied:
             flash("Wrong email or password.", "error")
         return home()
 
     @app.post("/register")
     def register():
-        if request.form.get("password") != request.form.get("confirm"):
+        password = request.form.get("password", "")
+        if password != request.form.get("confirm"):
             flash("Passwords do not match.", "error")
             return home()
         try:
-            start(v.register(request.form.get("email", ""), request.form.get("password", "")))
+            start(v.register(request.form.get("email", ""), password), password)
             flash("Account created.", "ok")
         except VaultError as e:
             flash(str(e), "error")
@@ -148,7 +160,15 @@ def create_app(vault: Vault):
         password = request.form.get("password") or None
         if password != (request.form.get("confirm") or None):
             raise VaultError("the file passwords do not match")
-        fid = v.store(user, f.filename, f.read(), request.form.getlist("layer"), password)
+        try:
+            threshold = int(request.form.get("threshold") or 0)
+            destroy_at = request.form.get("destroy_at")
+            destroy_at = datetime.strptime(destroy_at, "%Y-%m-%dT%H:%M").timestamp() if destroy_at else None
+        except ValueError:
+            raise VaultError("invalid quorum size or self-destruct time")
+        approvers = request.form.get("approvers", "").replace(",", " ").split()
+        fid = v.store(user, f.filename, f.read(), request.form.getlist("layer"), password, signer=my_keys()["sign"],
+                      approvers=approvers, threshold=threshold, destroy_at=destroy_at)
         flash(f"Locked {f.filename}. Share it below.", "ok")
         return redirect(url_for("file_page", fid=fid))
 
@@ -167,6 +187,8 @@ def create_app(vault: Vault):
             data, meta, perm = v.read(fid, user, "view", key_for(fid))
         except PasswordRequired as e:
             return render_template("unlock.html", user=user, fid=fid, message=str(e))
+        except QuorumRequired as e:
+            return render_template("unlock.html", user=user, fid=fid, message=str(e), quorum=e.status)
         k = preview.kind(meta["type"])
         text = data[:preview.MAX_TEXT * 4].decode("utf-8", "replace")[:preview.MAX_TEXT] if k == "text" else None
         try:
@@ -175,8 +197,9 @@ def create_app(vault: Vault):
             k, pages = None, 0
         activity, broken_at = v.activity(fid, user) if perm == "owner" else ([], None)
         return render_template("file.html", user=user, fid=fid, meta=meta, perm=perm, kind=k, text=text,
-                               pages=pages, activity=activity, log_broken_at=broken_at,
-                               info=v.inspect(fid, user))
+                               pages=pages, activity=activity, log_broken_at=broken_at, info=v.inspect(fid, user),
+                               fingerprint=v.fingerprint(meta["owner"]),
+                               quorum=v.quorum_status(fid, meta) if "quorum" in meta else None)
 
     @app.post("/file/<fid>/unlock")
     @logged_in
@@ -186,6 +209,13 @@ def create_app(vault: Vault):
         except AccessDenied as e:
             flash(str(e), "error")
         return redirect(url_for("file_page", fid=fid))
+
+    @app.post("/file/<fid>/approve")
+    @logged_in
+    def approve(user, fid):
+        v.approve(fid, user, my_keys()["box"])
+        flash(f"Approved for {v.approval_ttl // 60} minutes. Your share was released; it was never stored unencrypted.", "ok")
+        return home()
 
     @app.get("/file/<fid>/page/<int:n>.png")
     @logged_in
@@ -236,7 +266,7 @@ def create_app(vault: Vault):
     @logged_in
     def delete(user, fid):
         v.delete(fid, user)
-        flash("File deleted. Every locked copy of it is now permanently unopenable.", "ok")
+        flash("Key destroyed. Every copy of the file, locked copies and backups included, is now undecryptable noise.", "ok")
         return home()
 
     return app

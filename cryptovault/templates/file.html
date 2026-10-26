@@ -7,6 +7,9 @@
       <h1>{{ meta.name }}</h1>
       <p class="small muted" style="margin:0 0 6px">{{ meta.size | size }} · {{ meta.type }} · owned by {{ meta.owner }} · locked {{ meta.created | when }}</p>
       {% for l in info.header.layers %}<span class="badge ok">{{ LAYER_NAMES[l] }}</span> {% endfor %}
+      <p class="small" style="margin:8px 0 0"><span style="color:var(--ok)">✓ Signed by {{ meta.owner }}</span>
+        <span class="muted">· Ed25519 key <code>{{ fingerprint }}</code> · the signature was checked just now</span></p>
+      {% if meta.destroy_at %}<p class="small" style="margin:4px 0 0;color:var(--err)">💣 Self-destructs {{ meta.destroy_at | when }}</p>{% endif %}
     </div>
     <div class="actions">
       {% if perm in ("owner", "download") and "lockdown" not in info.header.layers %}<a class="btn primary" href="/file/{{ fid }}/download">Download original</a>{% endif %}
@@ -32,6 +35,17 @@
     <p class="muted">No preview for this file type.{% if perm == "view" %} Ask the owner for download permission.{% endif %}</p>
   {% endif %}
 </div>
+
+{% if perm == "owner" and quorum %}
+<div class="card">
+  <h2>Approval quorum <span class="badge">{{ quorum.k }} of {{ quorum.approvers | length }}</span></h2>
+  <p class="small muted">The key includes a secret split with Shamir's scheme. Each approver's share is encrypted to their own key,
+  so neither you nor the server can open this file alone. Approvals last an hour and are kept only in memory.</p>
+  {% for email, until in quorum.approvers.items() %}
+    <span class="badge{% if until %} ok{% endif %}">{{ email }}: {{ "approved until " ~ (until | clock) if until else "not approved" }}</span>
+  {% endfor %}
+</div>
+{% endif %}
 
 {% if perm == "owner" %}
 <div class="card">
@@ -77,10 +91,11 @@
 </div>
 
 <details class="card">
-  <summary>Delete this file…</summary>
+  <summary>Shred this file…</summary>
   <form method="post" action="/file/{{ fid }}/delete" style="border:0;padding:0;margin-top:12px">
-    <p class="small muted">Deleting also makes every locked copy anyone downloaded permanently unopenable.</p>
-    <button class="danger">Delete permanently</button>
+    <p class="small muted">Crypto-shredding: the file's key is destroyed. Every copy of the ciphertext, including locked copies
+    people downloaded and backups, becomes permanently undecryptable.</p>
+    <button class="danger">Shred permanently</button>
   </form>
 </details>
 {% endif %}
@@ -91,15 +106,17 @@
     <label>File <code>{{ info.file }}</code> ({{ info.disk_size }} bytes on disk). The name, owner and access list are not visible.</label>
     <pre>file_id      {{ info.header.file_id }}
 nonce_prefix {{ info.header.nonce_prefix }}
-wrapped_key  {{ info.header.wrapped_key[:72] }}…   (RSA-OAEP with the system public key)
 layers       {{ info.header.layers | join(", ") }}   (part of the AAD, so no layer can be stripped)
 kdf          {{ info.header.kdf or "none (no password layer)" }}</pre>
+    <label>File key K: stored separately in <code>keys/{{ fid }}.key</code>, never inside the file (RSA-OAEP with the system public key)</label>
+    <pre>{{ info.wrapped_key[:96] }}…</pre>
     <label>Sealed metadata: name, owner, access list ({{ info.sealed_meta | length }} bytes, AES-256-GCM)</label>
     <pre>{{ info.sealed_meta[:48].hex() }}…</pre>
     <label>Data: {{ info.segments }} STREAM segment{{ "s" if info.segments != 1 }}, {{ info.data_len }} bytes (AES-256-GCM, 16-byte tag each{% if "cascade" in info.header.layers %}, wrapping a ChaCha20-Poly1305 layer{% endif %})</label>
     <pre>{{ info.data_head.hex() }}…</pre>
     <label>Integrity</label>
-    <pre>digest  {{ meta.digest }}   (HMAC-SHA256 under a key derived from the content key)</pre>
+    <pre>digest     {{ meta.digest }}   (HMAC-SHA256 under a key derived from the content key)
+signature  {{ meta.signature[:64] }}…   (Ed25519 by {{ meta.owner }})</pre>
   </div>
 </details>
 {% endblock %}

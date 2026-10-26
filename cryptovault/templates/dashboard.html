@@ -1,11 +1,33 @@
 {% extends "base.html" %}
 {% block header %}
 <div class="row">
-  <span class="small muted">Signed in as <strong style="color:var(--text)">{{ user }}</strong></span>
+  <span class="small muted">Signed in as <strong style="color:var(--text)">{{ user }}</strong>
+    · signing key <code title="Ed25519 public key fingerprint">{{ fingerprint }}</code></span>
   <form method="post" action="/logout"><button>Log out</button></form>
 </div>
 {% endblock %}
 {% block body %}
+{% if approvals %}
+<div class="card">
+  <h2>🗳 Waiting for your approval</h2>
+  <p class="small muted">These files need several people to agree before they open. Approving releases your share of the key
+  for one hour. It doesn't let you read the file.</p>
+  <div class="table-wrap"><table>
+    <tr><th>File</th><th>Owner</th><th>Approvals</th><th></th></tr>
+    {% for f in approvals %}
+    {% set given = f.status.approvers.values() | select | list | length %}
+    <tr>
+      <td><strong>{{ f.name }}</strong></td>
+      <td>{{ f.owner }}</td>
+      <td><span class="badge{% if given >= f.status.k %} ok{% endif %}">{{ given }} of {{ f.status.k }} needed</span></td>
+      <td>{% if f.status.approvers[user] %}<span class="badge ok">✓ you approved until {{ f.status.approvers[user] | clock }}</span>
+          {% else %}<form method="post" action="/file/{{ f.id }}/approve"><button class="primary">Approve</button></form>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </table></div>
+</div>
+{% endif %}
+
 {% if broken %}
   <div class="flash error">⚠ {{ broken | length }} stored file{{ "s" if broken | length != 1 }} failed the integrity check and
   can't be opened by anyone: {% for b in broken %}<code>{{ b[:8] }}</code> {% endfor %}</div>
@@ -15,11 +37,17 @@
   <form class="card" method="post" action="/upload" enctype="multipart/form-data">
     <h2>🔒 Lock a new file</h2>
     <input type="file" name="file" required>
-    <label>Protection: pick any mix (the server key, a password, or both must hold the key)</label>
+    <label>Protection: pick any mix. At least one of the first three must hold the key; every one you tick is required.</label>
     <label class="check"><input type="checkbox" name="layer" value="system" checked> <span><strong>Server key</strong>
       <span class="muted small">RSA-3072. CryptoVault can open it for people you share with, no password needed.</span></span></label>
     <label class="check"><input type="checkbox" name="layer" value="password"> <span><strong>Password</strong>
       <span class="muted small">scrypt. Asked on every open. Alone, not even the server can read it.</span></span></label>
+    <label class="check"><input type="checkbox" name="layer" value="quorum"> <span><strong>Approval quorum</strong>
+      <span class="muted small">Shamir secret sharing. Opens only after k of the people below approve (each needs an account).</span></span></label>
+    <div class="row" style="margin:0 0 8px 24px">
+      <input type="text" name="approvers" placeholder="Approvers: bob@gmail.com, carol@gmail.com, …" style="flex:3">
+      <input type="text" name="threshold" inputmode="numeric" placeholder="k (e.g. 2)" style="flex:1">
+    </div>
     <label class="check"><input type="checkbox" name="layer" value="cascade"> <span><strong>Double encryption</strong>
       <span class="muted small">ChaCha20-Poly1305 inside AES-256-GCM, independent keys.</span></span></label>
     <label class="check"><input type="checkbox" name="layer" value="lockdown"> <span><strong>Lockdown</strong>
@@ -28,7 +56,9 @@
       <input type="password" name="password" placeholder="File password (if ticked)" autocomplete="new-password" style="flex:1">
       <input type="password" name="confirm" placeholder="Repeat it" autocomplete="new-password" style="flex:1">
     </div>
-    <p class="small muted">Really confidential? Tick all four.</p>
+    <label for="destroy">Self-destruct at (optional): the key is destroyed, so every copy anywhere dies</label>
+    <input type="datetime-local" id="destroy" name="destroy_at">
+    <p class="small muted">Really confidential? Tick everything.</p>
     <button class="primary">Encrypt &amp; store</button>
   </form>
   <form class="card" method="post" action="/open" enctype="multipart/form-data">
