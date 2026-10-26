@@ -27,13 +27,13 @@ h1 { font-size: 22px; margin: 0 0 4px; }
 h2 { font-size: 16px; margin: 0 0 12px; }
 p { margin: 0 0 12px; }
 label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px; }
-input[type=text], input[type=password], input[type=file] {
+input[type=text], input[type=email], input[type=password], input[type=file], input[type=date], select {
   width: 100%; padding: 9px 12px; margin-bottom: 12px; font: inherit; color: var(--text);
   background: var(--bg); border: 1px solid var(--border); border-radius: 8px; }
 button, .btn { display: inline-block; padding: 7px 13px; font: inherit; font-size: 14px; color: var(--text); text-decoration: none;
   background: var(--bg); border: 1px solid var(--border); border-radius: 8px; cursor: pointer; }
 button:hover, .btn:hover { border-color: var(--accent); }
-button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; }
+button.primary, .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; }
 button.danger { color: var(--err); }
 .flash { padding: 10px 14px; border-radius: 8px; margin-bottom: 16px; border: 1px solid; background: var(--panel); }
 .flash.ok { color: var(--ok); border-color: var(--ok); }
@@ -59,6 +59,17 @@ details summary { cursor: pointer; color: var(--accent); font-size: 14px; }
 details form { margin-top: 8px; padding: 10px; border: 1px solid var(--border); border-radius: 8px; }
 .check { display: flex; gap: 6px; align-items: center; font-size: 14px; color: var(--text); margin: 0 0 6px; }
 .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.row > * { margin-bottom: 0; }
+.badge.warn { color: var(--err); border-color: var(--err); }
+.text-preview { position: relative; user-select: none; -webkit-user-select: none; }
+.text-preview pre { margin: 0; min-height: 220px; }
+.text-preview::after { content: ""; position: absolute; inset: 0; background: url('/watermark.png'); pointer-events: none; border-radius: 8px; }
+.page-img { display: block; width: 100%; height: auto; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 12px;
+            user-select: none; -webkit-user-drag: none; }
+.share-form { display: grid; grid-template-columns: 2fr 1fr 1fr auto; gap: 8px; align-items: end; }
+.share-form input, .share-form select { margin-bottom: 0; }
+@media (max-width: 720px) { .share-form { grid-template-columns: 1fr; } }
+.log td { font-size: 13px; }
 </style>
 </head>
 <body>

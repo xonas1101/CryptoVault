@@ -1,28 +1,24 @@
 # CryptoVault
 
-Secure multi-user file storage using **hybrid encryption**.
+Share files without letting them escape. A web app where you lock files with **hybrid
+encryption**, share them **by email** as view-only or downloadable, with optional expiry,
+and keep control afterwards.
 
-- **AES-256-GCM** in the STREAM construction encrypts file contents, in segments, so files of any size work
-- **RSA-3072-OAEP** wraps each file's random key separately for every recipient
-- **Ed25519** signatures prove who stored a file
-- **scrypt** protects private keys with a password
-- **HKDF** gives each derived key exactly one job
-
-Features: encrypted filenames, sharing without re-encryption, real revocation by
-re-keying, tamper, truncation and reorder detection, and no release of unverified plaintext.
+- **AES-256-GCM** (STREAM construction) encrypts every file under its own random key, and **RSA-3072-OAEP** wraps that key with a system key only the server holds
+- Recipients never receive a key. **Downloads are locked `.cvault` copies** that open only inside CryptoVault, only for people the owner *currently* allows. Revoke someone and the copies they took stop working.
+- **Watermarked previews**: every image and PDF page is rendered with the viewer's email burned in
+- **Tamper-evident activity log** (HMAC hash chain), including denied attempts
+- Access lists live *inside* the encryption, so nobody can grant themselves access by editing disk
+- **scrypt** for passwords and the master key, **HKDF** key separation, strict web security headers
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python -m unittest -v      # 20 security tests
-./demo.sh                  # live walkthrough
+python -m unittest -v           # 30 tests
+python -m cryptovault --demo    # then open http://127.0.0.1:8000
 ```
 
-```bash
-python -m cryptovault adduser alice
-python -m cryptovault put report.pdf -u alice --share bob
-python -m cryptovault ls -u bob
-python -m cryptovault get <id> -u bob
-```
+Demo logins: `alice@gmail.com` / `alice-password`, `bob@gmail.com` / `bob-password`, `eve@gmail.com` / `eve-password`.
 
-**Read [GUIDE.md](GUIDE.md) for the full explanation:** design, file format, threat model and presentation notes.
+**Read [GUIDE.md](GUIDE.md) for everything:** design, file format, the key-holding
+trade-off, threat model, and a presentation script.

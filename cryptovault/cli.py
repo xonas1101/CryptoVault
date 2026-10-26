@@ -1,123 +1,83 @@
-"""Command-line interface. Run `python -m cryptovault --help`."""
+"""Server entry point: python -m cryptovault [--demo]"""
 import argparse
 import getpass
+import io
 import os
 import sys
-from datetime import datetime
 
 from .crypto import CryptoError
 from .vault import Vault, VaultError
 
 
-def ask(prompt, confirm=False, env="CRYPTOVAULT_PASSWORD"):
+def ask(prompt, confirm=False):
     # The env variable exists only for scripted demos and tests. Environment variables can leak via /proc and shell history.
-    if os.environ.get(env):
-        return os.environ[env]
-    password = getpass.getpass(prompt)
-    if confirm and password != getpass.getpass("Repeat password: "):
-        raise VaultError("passwords do not match")
-    return password
+    if os.environ.get("CRYPTOVAULT_MASTER_PASSWORD"):
+        return os.environ["CRYPTOVAULT_MASTER_PASSWORD"]
+    passphrase = getpass.getpass(prompt)
+    if confirm and passphrase != getpass.getpass("Repeat: "):
+        raise VaultError("passphrases do not match")
+    return passphrase
 
 
-def user_list(text):
-    return [n.strip() for n in text.split(",") if n.strip()]
+def seed(v: Vault):
+    """Demo accounts and sample files, so a presentation can start straight away."""
+    from PIL import Image, ImageDraw, ImageFont
 
-
-def parser():
-    p = argparse.ArgumentParser(
-        prog="cryptovault",
-        description="Secure file storage with hybrid encryption (RSA-OAEP + AES-256-GCM, signed with Ed25519).")
-    p.add_argument("--vault", default=os.environ.get("CRYPTOVAULT_DIR", "vault"),
-                   help="vault directory (default: ./vault or $CRYPTOVAULT_DIR)")
-    sub = p.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
-
-    def command(name, help, user=True):
-        s = sub.add_parser(name, help=help, description=help)
-        if user:
-            default = os.environ.get("CRYPTOVAULT_USER")
-            s.add_argument("-u", "--user", default=default, required=default is None,
-                           help="who you are (default: $CRYPTOVAULT_USER)")
-        return s
-
-    command("adduser", "create a user with encryption and signing keys", user=False).add_argument("name")
-    command("users", "list users and their key fingerprints", user=False)
-    command("passwd", "change your password")
-    s = command("put", "encrypt a file into the vault")
-    s.add_argument("file")
-    s.add_argument("--share", type=user_list, default=[], metavar="U1,U2", help="also give these users access")
-    command("ls", "list the files you can open")
-    s = command("get", "decrypt a file out of the vault")
-    s.add_argument("id")
-    s.add_argument("-o", "--out", help="output path (default: the original file name)")
-    command("verify", "check integrity and signature without writing anything").add_argument("id")
-    s = command("share", "give more users access (re-wraps the key, no re-encryption)")
-    s.add_argument("id")
-    s.add_argument("--with", dest="targets", type=user_list, required=True, metavar="U1,U2")
-    s = command("revoke", "remove access by re-encrypting under a fresh key (owner only)")
-    s.add_argument("id")
-    s.add_argument("--from", dest="targets", type=user_list, required=True, metavar="U1,U2")
-    command("rm", "delete a file (owner only)").add_argument("id")
-    s = command("serve", "run the web interface", user=False)
-    s.add_argument("--host", default="127.0.0.1", help="default 127.0.0.1 (this machine only)")
-    s.add_argument("--port", type=int, default=8000)
-    return p
-
-
-def run(args):
-    v = Vault(args.vault)
-    if args.cmd == "adduser":
-        fp = v.add_user(args.name, ask(f"New password for {args.name}: ", confirm=True))
-        print(f"created user {args.name}\nfingerprint {fp}")
+    if v.has_users():
+        print("demo: vault already has users, not seeding")
         return
-    if args.cmd == "users":
-        for name in v.users():
-            print(f"{name:<16} {v.fingerprint(name)}")
-        return
-    if args.cmd == "serve":
-        from .web import create_app
-        if args.host not in ("127.0.0.1", "localhost"):
-            print("WARNING: serving beyond this machine over plain HTTP. Passwords would cross the network unencrypted.")
-        create_app(args.vault).run(host=args.host, port=args.port)
-        return
+    for name in ("alice", "bob", "eve"):
+        v.register(f"{name}@gmail.com", f"{name}-password")
 
-    pw = ask(f"Password for {args.user}: ")
-    if args.cmd == "passwd":
-        v.change_password(args.user, pw, ask("New password: ", confirm=True, env="CRYPTOVAULT_NEW_PASSWORD"))
-        print("password changed (only your keystore was re-encrypted, not your files)")
-    elif args.cmd == "put":
-        fid = v.put(args.file, args.user, pw, args.share)
-        print(f"stored {os.path.basename(args.file)}\nid {fid}")
-    elif args.cmd == "ls":
-        print(f"{'ID':<9} {'NAME':<24} {'SIZE':>11}  {'OWNER':<10} {'CREATED':<16}  SHARED WITH")
-        for r in v.ls(args.user, pw):
-            if "error" in r:
-                print(f"{r['id'][:8]:<9} !! {r['error']}")
-                continue
-            created = datetime.fromtimestamp(r["created"]).strftime("%Y-%m-%d %H:%M")
-            others = ", ".join(x for x in r["recipients"] if x != r["owner"]) or "-"
-            print(f"{r['id'][:8]:<9} {r['name'][:24]:<24} {r['size']:>11,}  {r['owner']:<10} {created:<16}  {others}")
-    elif args.cmd == "get":
-        out, meta = v.get(args.id, args.user, pw, args.out)
-        print(f"decrypted {meta['name']} -> {out}\n[ok] every segment authentic  [ok] sha256 matches  [ok] signed by {meta['owner']}")
-    elif args.cmd == "verify":
-        meta = v.verify(args.id, args.user, pw)
-        print(f"OK {meta['name']}: every segment authentic, sha256 matches, signed by {meta['owner']}")
-    elif args.cmd == "share":
-        v.share(args.id, args.user, pw, args.targets)
-        print(f"shared with {', '.join(args.targets)}")
-    elif args.cmd == "revoke":
-        new_id = v.revoke(args.id, args.user, pw, args.targets)
-        print(f"revoked {', '.join(args.targets)}; file re-encrypted under a new key\nid {new_id}")
-    elif args.cmd == "rm":
-        v.remove(args.id, args.user, pw)
-        print("deleted")
+    font = ImageFont.load_default(size=36)
+    img = Image.new("RGB", (900, 560), "#1f2a44")
+    draw = ImageDraw.Draw(img)
+    draw.rectangle((60, 60, 840, 500), outline="#7d97ff", width=6)
+    draw.text((110, 230), "PROTOTYPE - CONFIDENTIAL", font=font, fill="white")
+    png = io.BytesIO()
+    img.save(png, "PNG")
+
+    pages = []
+    for i, line in enumerate(["Employment contract", "Salary: 1,20,000 / month", "Signed: Alice"]):
+        page = Image.new("RGB", (850, 1100), "white")
+        ImageDraw.Draw(page).text((80, 120), f"Page {i + 1}\n\n{line}", font=font, fill="black")
+        pages.append(page)
+    pdf = io.BytesIO()
+    pages[0].save(pdf, "PDF", save_all=True, append_images=pages[1:])
+
+    alice = "alice@gmail.com"
+    plan = v.store(alice, "launch-plan.txt", b"Q3 launch plan\n\n1. Ship on 1 Dec\n2. Do not tell anyone\n")
+    logo = v.store(alice, "prototype.png", png.getvalue())
+    contract = v.store(alice, "contract.pdf", pdf.getvalue())
+    v.share(plan, alice, "bob@gmail.com", "view")
+    v.share(logo, alice, "bob@gmail.com", "view")
+    v.share(contract, alice, "bob@gmail.com", "download")
+    print("demo accounts: alice@gmail.com / alice-password, bob@gmail.com / bob-password, eve@gmail.com / eve-password")
 
 
 def main(argv=None):
-    args = parser().parse_args(argv)
+    p = argparse.ArgumentParser(prog="cryptovault", description="CryptoVault: secure file sharing with hybrid encryption.")
+    p.add_argument("--vault", default=os.environ.get("CRYPTOVAULT_DIR", "vault"), help="vault directory (default ./vault)")
+    p.add_argument("--host", default="127.0.0.1", help="default 127.0.0.1 (this machine only)")
+    p.add_argument("--port", type=int, default=8000)
+    p.add_argument("--demo", action="store_true", help="create demo accounts and sample files in an empty vault")
+    args = p.parse_args(argv)
+
+    v = Vault(args.vault)
     try:
-        run(args)
-    except (VaultError, CryptoError, OSError) as e:
+        if v.initialized():
+            v.unlock(ask("Master passphrase: "))
+        else:
+            print(f"Creating a new vault in {args.vault}/")
+            v.initialize(ask("Choose a master passphrase (12+ characters): ", confirm=True))
+        if args.demo:
+            seed(v)
+    except (VaultError, CryptoError) as e:
         sys.exit(f"error: {e}")
     except (KeyboardInterrupt, EOFError):
         sys.exit(130)
+
+    if args.host not in ("127.0.0.1", "localhost"):
+        print("WARNING: serving beyond this machine over plain HTTP. Passwords would cross the network unencrypted.")
+    from .web import create_app
+    create_app(v).run(host=args.host, port=args.port)

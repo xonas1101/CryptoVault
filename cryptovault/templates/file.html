@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block header %}<a class="btn" href="/">← All files</a>{% endblock %}
+{% block body %}
+<div class="card">
+  <div class="row" style="justify-content:space-between">
+    <div>
+      <h1>{{ meta.name }}</h1>
+      <p class="small muted" style="margin:0">{{ meta.size | size }} · {{ meta.type }} · owned by {{ meta.owner }} · locked {{ meta.created | when }}</p>
+    </div>
+    <div class="actions">
+      {% if perm in ("owner", "download") %}<a class="btn primary" href="/file/{{ fid }}/download">Download original</a>{% endif %}
+      <a class="btn" href="/file/{{ fid }}/locked">Download locked copy</a>
+    </div>
+  </div>
+  {% if perm == "view" %}
+    <p class="small muted" style="margin:12px 0 0">View only. The owner hasn't allowed downloading the original. A locked copy
+    opens only inside CryptoVault, and only while you still have access.</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Preview <span class="badge">watermarked for {{ user }}</span></h2>
+  {% if kind == "text" %}
+    <div class="text-preview"><pre>{{ text }}</pre></div>
+  {% elif kind in ("image", "pdf") %}
+    {% for n in range(pages) %}<img class="page-img" src="/file/{{ fid }}/page/{{ n }}.png" alt="{{ meta.name }} page {{ n + 1 }}" draggable="false">{% endfor %}
+  {% else %}
+    <p class="muted">No preview for this file type.{% if perm == "view" %} Ask the owner for download permission.{% endif %}</p>
+  {% endif %}
+</div>
+
+{% if perm == "owner" %}
+<div class="card">
+  <h2>Who has access</h2>
+  {% if meta.shares %}
+  <div class="table-wrap"><table>
+    <tr><th>Email</th><th>Permission</th><th>Until</th><th></th></tr>
+    {% for email, s in meta.shares.items() %}
+    <tr>
+      <td>{{ email }}</td>
+      <td><span class="badge">{{ "view + download" if s.perm == "download" else "view only" }}</span></td>
+      <td class="small">{{ s.until | day }}</td>
+      <td><form method="post" action="/file/{{ fid }}/revoke"><input type="hidden" name="email" value="{{ email }}"><button class="danger">Revoke</button></form></td>
+    </tr>
+    {% endfor %}
+  </table></div>
+  {% else %}
+    <p class="muted">Only you can open this file.</p>
+  {% endif %}
+  <form class="share-form" method="post" action="/file/{{ fid }}/share" style="margin-top:16px">
+    <div><label for="s-email">Share with email</label><input type="email" id="s-email" name="email" placeholder="friend@gmail.com" required></div>
+    <div><label for="s-perm">Permission</label>
+      <select id="s-perm" name="perm"><option value="view">View only</option><option value="download">View + download</option></select></div>
+    <div><label for="s-until">Expires (optional)</label><input type="date" id="s-until" name="until"></div>
+    <button class="primary">Share</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>Activity
+    {% if log_broken_at is none %}<span class="badge ok">✓ log chain verified</span>
+    {% else %}<span class="badge warn">⚠ log tampered at entry {{ log_broken_at + 1 }}</span>{% endif %}
+  </h2>
+  <div class="table-wrap"><table class="log">
+    <tr><th>When</th><th>Who</th><th>What</th><th>Detail</th></tr>
+    {% for e in activity | reverse %}
+    <tr{% if e.action == "denied" %} class="bad"{% endif %}><td>{{ e.ts | when }}</td><td>{{ e.actor }}</td><td>{{ e.action }}</td><td>{{ e.detail }}</td></tr>
+    {% endfor %}
+  </table></div>
+</div>
+
+<details class="card">
+  <summary>Delete this file…</summary>
+  <form method="post" action="/file/{{ fid }}/delete" style="border:0;padding:0;margin-top:12px">
+    <p class="small muted">Deleting also makes every locked copy anyone downloaded permanently unopenable.</p>
+    <button class="danger">Delete permanently</button>
+  </form>
+</details>
+{% endif %}
+
+<details class="card">
+  <summary>Under the hood: what's actually stored on disk</summary>
+  <div style="margin-top:12px">
+    <label>File <code>{{ info.file }}</code> ({{ info.disk_size }} bytes on disk). The name, owner and access list are not visible.</label>
+    <pre>file_id      {{ info.header.file_id }}
+nonce_prefix {{ info.header.nonce_prefix }}
+wrapped_key  {{ info.header.wrapped_key[:72] }}…   (RSA-OAEP with the system public key)</pre>
+    <label>Sealed metadata: name, owner, access list ({{ info.sealed_meta | length }} bytes, AES-256-GCM)</label>
+    <pre>{{ info.sealed_meta[:48].hex() }}…</pre>
+    <label>Data: {{ info.segments }} STREAM segment{{ "s" if info.segments != 1 }}, {{ info.data_len }} bytes (AES-256-GCM, 16-byte tag each)</label>
+    <pre>{{ info.data_head.hex() }}…</pre>
+    <label>Integrity</label>
+    <pre>sha256  {{ meta.sha256 }}</pre>
+  </div>
+</details>
+{% endblock %}

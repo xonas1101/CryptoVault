@@ -3,28 +3,30 @@
 Every security-critical operation lives in this one module so it can be reviewed
 in one place. Nothing here touches the filesystem.
 
-  keystore        scrypt (password -> key) + AES-256-GCM protects a user's private keys
-  key wrapping    RSA-3072-OAEP-SHA256 encrypts a per-file key for each recipient
-  key separation  HKDF-SHA256 splits the file key into independent sub-keys
-  streaming       AES-256-GCM in the STREAM construction, for files of any size
-  signatures      Ed25519 proves who stored a file
+  sealed secrets   scrypt (master passphrase -> key) + AES-256-GCM protects the system's keys
+  password hashes  scrypt with a per-user salt, compared in constant time
+  key wrapping     RSA-3072-OAEP-SHA256 encrypts each file's random key (the "hybrid" part)
+  key separation   HKDF-SHA256 derives independent keys from one secret
+  streaming AEAD   AES-256-GCM in the STREAM construction, for files of any size
+  integrity tags   HMAC-SHA256 for the user table and the audit log hash chain
 """
 import base64
 import hashlib
+import hmac
 import json
 import os
 import struct
 
-from cryptography.exceptions import InvalidSignature, InvalidTag
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ed25519, padding, rsa
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
 RSA_BITS = 3072                      # ~128-bit security (NIST SP 800-57)
 OAEP = padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
-SCRYPT = {"n": 2**15, "r": 8, "p": 1}  # 32 MiB of memory per password guess
+SCRYPT = {"n": 2**15, "r": 8, "p": 1}  # 32 MiB of memory per guess
 CHUNK = 64 * 1024                    # plaintext bytes per STREAM segment
 TAG = 16                             # GCM authentication tag size
 PREFIX = 7                           # STREAM nonce = prefix(7) | counter(4) | last-flag(1)
@@ -46,91 +48,104 @@ def b64d(text: str) -> bytes:
 
 
 def canon(obj) -> bytes:
-    """Canonical JSON: the same object always gives the same bytes (required before signing or using as AAD)."""
+    """Canonical JSON: the same object always gives the same bytes (required before MACing or using as AAD)."""
     return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
 
 
 # ---------- single-shot AEAD ----------
 
-def seal(key: bytes, nonce: bytes, plaintext: bytes, aad: bytes) -> bytes:
-    return AESGCM(key).encrypt(nonce, plaintext, aad)
+def seal(key: bytes, plaintext: bytes, aad: bytes) -> bytes:
+    """AES-256-GCM with a fresh random nonce, returned as nonce || ciphertext || tag."""
+    nonce = os.urandom(12)
+    return nonce + AESGCM(key).encrypt(nonce, plaintext, aad)
 
 
-def unseal(key: bytes, nonce: bytes, ciphertext: bytes, aad: bytes, what: str) -> bytes:
+def unseal(key: bytes, sealed: bytes, aad: bytes, what: str) -> bytes:
     try:
-        return AESGCM(key).decrypt(nonce, ciphertext, aad)
+        return AESGCM(key).decrypt(sealed[:12], sealed[12:], aad)
     except (InvalidTag, ValueError):
         raise CryptoError(f"{what} failed authentication (tampered or wrong key)") from None
 
 
-# ---------- identities and the password-protected keystore ----------
+# ---------- passwords ----------
 
-def new_identity():
-    """Each user gets two key pairs: RSA for encryption, Ed25519 for signing.
-    Using one key for both jobs is a classic mistake, since the two uses can interfere."""
-    return rsa.generate_private_key(public_exponent=65537, key_size=RSA_BITS), ed25519.Ed25519PrivateKey.generate()
+def _scrypt(password: str, kdf: dict) -> bytes:
+    return Scrypt(salt=b64d(kdf["salt"]), length=32, n=kdf["n"], r=kdf["r"], p=kdf["p"]).derive(password.encode())
 
 
-def public_pems(enc_key, sign_key) -> dict:
-    def pem(key):
-        return key.public_key().public_bytes(
-            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo).decode()
-    return {"enc": pem(enc_key), "sign": pem(sign_key)}
+def hash_password(password: str) -> dict:
+    """Slow, salted, memory-hard hash. The server stores this, never the password."""
+    kdf = {"salt": b64e(os.urandom(16)), **SCRYPT}
+    return {"kdf": kdf, "hash": b64e(_scrypt(password, kdf))}
 
 
-def load_public(pems: dict):
-    return (serialization.load_pem_public_key(pems["enc"].encode()),
-            serialization.load_pem_public_key(pems["sign"].encode()))
+DUMMY_HASH = hash_password("timing-equaliser")
 
 
-def fingerprint(pems: dict) -> str:
-    """Short hash of a user's public keys. Compare it out-of-band to detect a swapped key (like SSH fingerprints)."""
-    digest = hashlib.sha256(canon(pems)).hexdigest()[:32]
-    return ":".join(digest[i:i + 4] for i in range(0, 32, 4))
+def check_password(record: dict | None, password: str) -> bool:
+    # Unknown users are checked against a dummy hash, so response time doesn't reveal which emails have accounts.
+    record = record or DUMMY_HASH
+    return hmac.compare_digest(_scrypt(password, record["kdf"]), b64d(record["hash"])) and record is not DUMMY_HASH
 
 
-def _password_key(password: bytes, kdf: dict) -> bytes:
-    return Scrypt(salt=b64d(kdf["salt"]), length=32, n=kdf["n"], r=kdf["r"], p=kdf["p"]).derive(password)
+def seal_secrets(secrets: dict, passphrase: str) -> dict:
+    """Encrypt a dict of byte strings under a passphrase. The KDF parameters are the AAD, so they can't be quietly weakened."""
+    kdf = {"salt": b64e(os.urandom(16)), **SCRYPT}
+    body = canon({k: b64e(v) for k, v in secrets.items()})
+    return {"kdf": kdf, "sealed": b64e(seal(_scrypt(passphrase, kdf), body, canon(kdf)))}
 
 
-def seal_keystore(enc_key, sign_key, password: bytes) -> dict:
-    """Encrypt both private keys under a key derived from the password.
-    The KDF parameters are the AAD, so nobody can quietly weaken them."""
-    def der(key):
-        return key.private_bytes(serialization.Encoding.DER, serialization.PrivateFormat.PKCS8,
-                                 serialization.NoEncryption())
-    kdf = {"name": "scrypt", "salt": b64e(os.urandom(16)), **SCRYPT}
-    nonce = os.urandom(12)
-    secret = canon({"enc": b64e(der(enc_key)), "sign": b64e(der(sign_key))})
-    ct = seal(_password_key(password, kdf), nonce, secret, canon(kdf))
-    return {"kdf": kdf, "nonce": b64e(nonce), "ciphertext": b64e(ct)}
+def open_secrets(store: dict, passphrase: str) -> dict:
+    body = unseal(_scrypt(passphrase, store["kdf"]), b64d(store["sealed"]), canon(store["kdf"]), "master key (wrong passphrase?)")
+    return {k: b64d(v) for k, v in json.loads(body).items()}
 
 
-def open_keystore(store: dict, password: bytes):
-    kdf = store["kdf"]
-    secret = json.loads(unseal(_password_key(password, kdf), b64d(store["nonce"]),
-                               b64d(store["ciphertext"]), canon(kdf), "keystore (wrong password?)"))
-    return tuple(serialization.load_der_private_key(b64d(secret[k]), password=None) for k in ("enc", "sign"))
+# ---------- the system key pair ----------
+
+def new_system_key():
+    return rsa.generate_private_key(public_exponent=65537, key_size=RSA_BITS)
+
+
+def private_der(key) -> bytes:
+    return key.private_bytes(serialization.Encoding.DER, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+
+
+def load_private_der(der: bytes):
+    return serialization.load_der_private_key(der, password=None)
+
+
+def public_pem(key) -> bytes:
+    return key.public_key().public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+
+
+def load_public_pem(pem: bytes):
+    return serialization.load_pem_public_key(pem)
 
 
 # ---------- hybrid encryption: key wrapping and key separation ----------
 
-def wrap_key(file_key: bytes, enc_public) -> bytes:
-    return enc_public.encrypt(file_key, OAEP)
+def wrap_key(file_key: bytes, public_key) -> bytes:
+    return public_key.encrypt(file_key, OAEP)
 
 
-def unwrap_key(wrapped: bytes, enc_private) -> bytes:
+def unwrap_key(wrapped: bytes, private_key) -> bytes:
     try:
-        return enc_private.decrypt(wrapped, OAEP)
+        return private_key.decrypt(wrapped, OAEP)
     except ValueError:
         raise CryptoError("could not unwrap the file key") from None
 
 
-def subkeys(file_key: bytes, file_id: bytes) -> tuple[bytes, bytes]:
-    """HKDF turns one random file key into independent keys for the data and for the metadata,
-    so the two never share a (key, nonce) space."""
-    okm = HKDF(algorithm=hashes.SHA256(), length=64, salt=file_id, info=b"CryptoVault v2 data|meta").derive(file_key)
-    return okm[:32], okm[32:]
+def derive(secret: bytes, label: str, salt: bytes | None = None) -> bytes:
+    """HKDF: one secret -> many independent keys, one per purpose (key separation)."""
+    return HKDF(algorithm=hashes.SHA256(), length=32, salt=salt, info=b"CryptoVault v3 " + label.encode()).derive(secret)
+
+
+def mac(key: bytes, data: bytes) -> str:
+    return hmac.new(key, data, hashlib.sha256).hexdigest()
+
+
+def mac_ok(key: bytes, data: bytes, tag: str) -> bool:
+    return hmac.compare_digest(mac(key, data), tag)
 
 
 # ---------- streaming authenticated encryption (STREAM, Hoang et al. 2015) ----------
@@ -172,12 +187,3 @@ def decrypt_stream(key: bytes, prefix: bytes, aad: bytes, src):
         if not nxt:
             return
         counter, seg = counter + 1, nxt
-
-
-# ---------- signatures ----------
-
-def verify(sign_public, signature: bytes, data: bytes):
-    try:
-        sign_public.verify(signature, data)
-    except InvalidSignature:
-        raise CryptoError("signature invalid: this file was not stored by its claimed owner") from None

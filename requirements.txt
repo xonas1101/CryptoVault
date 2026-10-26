@@ -1,2 +1,4 @@
 cryptography>=42
 flask>=3
+pillow>=10.1
+pypdfium2>=4

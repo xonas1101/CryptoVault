@@ -1,27 +1,26 @@
-"""Web interface. Start with `python -m cryptovault serve`, then open http://127.0.0.1:8000
+"""Web interface on top of an unlocked Vault. Started by `python -m cryptovault`.
 
-This is only a front end. All security comes from vault.py and crypto.py, so the CLI
-and the web UI work on the same vault. After login, the server keeps the session's
-password in memory only (never on disk, never in the cookie) so it can unlock the
-user's keystore for each action. Logging out, or 15 minutes of inactivity, forgets it.
+Nothing security-critical happens here. Access control, encryption and logging all
+live in vault.py. This module turns HTTP requests into vault calls and renders pages.
 """
 import io
 import os
 import secrets
 import time
-from datetime import datetime
+from datetime import datetime, time as dtime
 from functools import wraps
 
-from flask import Flask, flash, redirect, render_template, request, send_file, session, url_for
+from flask import Flask, abort, flash, redirect, render_template, request, send_file, session, url_for
 
+from . import preview
 from .crypto import CryptoError
-from .vault import Vault, VaultError
+from .vault import AccessDenied, Vault, VaultError
 
 IDLE_TIMEOUT = 15 * 60
 MAX_UPLOAD = 100 * 1024 * 1024
 
 
-def create_app(vault_dir):
+def create_app(vault: Vault):
     app = Flask(__name__)
     app.config.update(
         SECRET_KEY=os.urandom(32),         # new on every start: restarting the server logs everyone out
@@ -29,23 +28,23 @@ def create_app(vault_dir):
         SESSION_COOKIE_HTTPONLY=True,      # JavaScript can't read the cookie
         SESSION_COOKIE_SAMESITE="Strict",  # cookie is never sent on cross-site requests, which blocks CSRF
     )
-    v = Vault(vault_dir)
+    v = vault
     # ponytail: in-process session table, so this works with a single server process only
-    sessions = {}  # random token -> {"user", "password", "seen"}
+    sessions = {}  # random token -> {"user", "seen"}
 
     def current():
         token = session.get("token")
         s = sessions.get(token)
         if s and time.time() - s["seen"] < IDLE_TIMEOUT:
             s["seen"] = time.time()
-            return s
+            return s["user"]
         sessions.pop(token, None)
         session.pop("token", None)  # not session.clear(): that would also wipe pending flash messages
         return None
 
-    def start(user, password):
+    def start(user):
         token = secrets.token_urlsafe(32)  # fresh token on every login, which prevents session fixation
-        sessions[token] = {"user": user, "password": password, "seen": time.time()}
+        sessions[token] = {"user": user, "seen": time.time()}
         session["token"] = token
 
     def home():
@@ -54,12 +53,12 @@ def create_app(vault_dir):
     def logged_in(fn):
         @wraps(fn)
         def wrapper(*args, **kwargs):
-            s = current()
-            if not s:
+            user = current()
+            if not user:
                 flash("Please log in.", "error")
                 return home()
             try:
-                return fn(s, *args, **kwargs)
+                return fn(user, *args, **kwargs)
             except (VaultError, CryptoError) as e:
                 flash(str(e), "error")
                 return home()
@@ -67,15 +66,20 @@ def create_app(vault_dir):
 
     @app.after_request
     def security_headers(resp):
-        resp.headers["Cache-Control"] = "no-store"  # never cache decrypted files or file lists
+        resp.headers["Cache-Control"] = "no-store"  # never cache decrypted content
         resp.headers["X-Content-Type-Options"] = "nosniff"
         resp.headers["X-Frame-Options"] = "DENY"
-        resp.headers["Content-Security-Policy"] = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'"
+        resp.headers["Content-Security-Policy"] = ("default-src 'none'; img-src 'self'; "
+                                                   "style-src 'unsafe-inline'; form-action 'self'")
         return resp
 
     @app.template_filter("when")
     def when(ts):
-        return datetime.fromtimestamp(ts).strftime("%d %b %Y, %H:%M")
+        return datetime.fromtimestamp(ts).strftime("%d %b %Y, %H:%M") if ts else "never"
+
+    @app.template_filter("day")
+    def day(ts):
+        return datetime.fromtimestamp(ts).strftime("%d %b %Y") if ts else "no expiry"
 
     @app.template_filter("size")
     def size(n):
@@ -89,42 +93,30 @@ def create_app(vault_dir):
 
     @app.get("/")
     def index():
-        s = current()
-        if not s:
+        user = current()
+        if not user:
             return render_template("login.html")
-        try:
-            files = v.ls(s["user"], s["password"])
-        except (VaultError, CryptoError) as e:
-            files = []
-            flash(str(e), "error")
-        others = [u for u in v.users() if u != s["user"]]
-        return render_template("dashboard.html", user=s["user"], fingerprint=v.fingerprint(s["user"]),
-                               files=files, others=others)
+        mine, shared, broken = v.files_for(user)
+        return render_template("dashboard.html", user=user, mine=mine, shared=shared, broken=broken)
 
     @app.post("/login")
     def login():
-        user, pw = request.form.get("user", "").strip().lower(), request.form.get("password", "")
         try:
-            v.unlock(user, pw)
-        except (VaultError, CryptoError):
-            flash("Wrong user name or password.", "error")  # same message either way, so user names can't be probed
-            return home()
-        start(user, pw)
+            start(v.authenticate(request.form.get("email", ""), request.form.get("password", "")))
+        except AccessDenied:
+            flash("Wrong email or password.", "error")
         return home()
 
     @app.post("/register")
     def register():
-        user, pw = request.form.get("user", "").strip().lower(), request.form.get("password", "")
-        if pw != request.form.get("confirm"):
+        if request.form.get("password") != request.form.get("confirm"):
             flash("Passwords do not match.", "error")
             return home()
         try:
-            fp = v.add_user(user, pw)
+            start(v.register(request.form.get("email", ""), request.form.get("password", "")))
+            flash("Account created.", "ok")
         except VaultError as e:
             flash(str(e), "error")
-            return home()
-        start(user, pw)
-        flash(f"Account created. Your key fingerprint is {fp}", "ok")
         return home()
 
     @app.post("/logout")
@@ -132,57 +124,96 @@ def create_app(vault_dir):
         sessions.pop(session.pop("token", None), None)
         return home()
 
+    @app.get("/watermark.png")
+    @logged_in
+    def watermark_tile(user):
+        return send_file(io.BytesIO(preview.tile_png(user)), mimetype="image/png")
+
     # ---------- files ----------
 
     @app.post("/upload")
     @logged_in
-    def upload(s):
+    def upload(user):
         f = request.files.get("file")
         if not f or not f.filename:
             raise VaultError("choose a file first")
-        v.put_data(f.filename, f.read(), s["user"], s["password"], request.form.getlist("share"))
-        flash(f"Locked {f.filename}.", "ok")
-        return home()
+        fid = v.store(user, f.filename, f.read())
+        flash(f"Locked {f.filename}. Share it below.", "ok")
+        return redirect(url_for("file_page", fid=fid))
+
+    @app.post("/open")
+    @logged_in
+    def open_locked(user):
+        f = request.files.get("file")
+        if not f or not f.filename:
+            raise VaultError("choose a .cvault file first")
+        return redirect(url_for("file_page", fid=v.resolve_locked(f.read(), user)))
+
+    @app.get("/file/<fid>")
+    @logged_in
+    def file_page(user, fid):
+        data, meta, perm = v.read(fid, user, "view")
+        k = preview.kind(meta["type"])
+        text = data[:preview.MAX_TEXT * 4].decode("utf-8", "replace")[:preview.MAX_TEXT] if k == "text" else None
+        try:
+            pages = preview.page_count(data, k) if k in ("image", "pdf") else 0
+        except Exception:  # an unreadable PDF just gets no preview
+            k, pages = None, 0
+        activity, broken_at = v.activity(fid, user) if perm == "owner" else ([], None)
+        return render_template("file.html", user=user, fid=fid, meta=meta, perm=perm, kind=k, text=text,
+                               pages=pages, activity=activity, log_broken_at=broken_at,
+                               info=v.inspect(fid, user))
+
+    @app.get("/file/<fid>/page/<int:n>.png")
+    @logged_in
+    def page_image(user, fid, n):
+        data, meta, _ = v.read(fid, user, action=None)  # the view itself was already logged by file_page
+        try:
+            png = preview.render_page(data, preview.kind(meta["type"]), n, user)
+        except Exception:
+            abort(404)
+        return send_file(io.BytesIO(png), mimetype="image/png")
 
     @app.get("/file/<fid>/download")
     @logged_in
-    def download(s, fid):
-        data, meta = v.read(fid, s["user"], s["password"])
-        return send_file(io.BytesIO(data), as_attachment=True, download_name=meta["name"])
+    def download(user, fid):
+        data, meta, _ = v.read(fid, user, "download")
+        return send_file(io.BytesIO(data), as_attachment=True, download_name=meta["name"],
+                         mimetype="application/octet-stream")  # never rendered inline
 
-    @app.get("/file/<fid>/inspect")
+    @app.get("/file/<fid>/locked")
     @logged_in
-    def inspect(s, fid):
-        return render_template("inspect.html", user=s["user"], fid=fid, info=v.inspect(fid, s["user"], s["password"]))
-
-    @app.post("/file/<fid>/verify")
-    @logged_in
-    def verify(s, fid):
-        meta = v.verify(fid, s["user"], s["password"])
-        flash(f"{meta['name']}: every segment authentic, SHA-256 matches, signed by {meta['owner']}.", "ok")
-        return home()
+    def download_locked(user, fid):
+        blob, meta = v.locked_copy(fid, user)
+        return send_file(io.BytesIO(blob), as_attachment=True, download_name=meta["name"] + ".cvault",
+                         mimetype="application/octet-stream")
 
     @app.post("/file/<fid>/share")
     @logged_in
-    def share(s, fid):
-        targets = request.form.getlist("users")
-        v.share(fid, s["user"], s["password"], targets)
-        flash(f"Shared with {', '.join(targets)}." if targets else "Nobody selected.", "ok")
-        return home()
+    def share(user, fid):
+        email = request.form.get("email", "")
+        until = request.form.get("until")
+        try:
+            until = datetime.combine(datetime.strptime(until, "%Y-%m-%d").date(), dtime.max).timestamp() if until else None
+        except ValueError:
+            raise VaultError("invalid expiry date")
+        v.share(fid, user, email, request.form.get("perm", "view"), until)
+        flash(f"Shared with {email.strip().lower()}.", "ok")
+        return redirect(url_for("file_page", fid=fid))
 
     @app.post("/file/<fid>/revoke")
     @logged_in
-    def revoke(s, fid):
-        targets = request.form.getlist("users")
-        v.revoke(fid, s["user"], s["password"], targets)
-        flash(f"Revoked {', '.join(targets)}. The file was re-encrypted under a fresh key.", "ok")
-        return home()
+    def revoke(user, fid):
+        email = request.form.get("email", "")
+        v.revoke(fid, user, email)
+        flash(f"Revoked {email}. Any locked copies they downloaded no longer open.", "ok")
+        return redirect(url_for("file_page", fid=fid))
 
     @app.post("/file/<fid>/delete")
     @logged_in
-    def delete(s, fid):
-        v.remove(fid, s["user"], s["password"])
-        flash("File deleted.", "ok")
+    def delete(user, fid):
+        v.delete(fid, user)
+        flash("File deleted. Every locked copy of it is now permanently unopenable.", "ok")
         return home()
 
     return app
