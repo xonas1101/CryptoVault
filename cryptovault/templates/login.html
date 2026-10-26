@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block body %}
+<div class="card">
+  <h1>Secure file storage</h1>
+  <p class="muted">Files are encrypted with AES-256-GCM under a fresh random key. That key is locked with each
+  recipient's RSA-3072 public key, and the owner signs every file with Ed25519. Your password unlocks your private
+  keys. It is never stored anywhere, and without it nobody can open your files, including whoever runs this server.</p>
+</div>
+<div class="grid2">
+  <form class="card" method="post" action="/login">
+    <h2>Log in</h2>
+    <label for="l-user">User name</label>
+    <input type="text" id="l-user" name="user" autocomplete="username" required>
+    <label for="l-pw">Password</label>
+    <input type="password" id="l-pw" name="password" autocomplete="current-password" required>
+    <button class="primary">Unlock</button>
+  </form>
+  <form class="card" method="post" action="/register">
+    <h2>Create account</h2>
+    <label for="r-user">User name <span class="small">(a-z, 0-9, _ and -)</span></label>
+    <input type="text" id="r-user" name="user" autocomplete="username" required>
+    <label for="r-pw">Password <span class="small">(at least 8 characters)</span></label>
+    <input type="password" id="r-pw" name="password" autocomplete="new-password" minlength="8" required>
+    <label for="r-confirm">Repeat password</label>
+    <input type="password" id="r-confirm" name="confirm" autocomplete="new-password" minlength="8" required>
+    <button class="primary">Generate my keys</button>
+    <p class="small muted" style="margin-top:10px">Creates an RSA-3072 and an Ed25519 key pair, sealed with your password using scrypt.</p>
+  </form>
+</div>
+{% endblock %}

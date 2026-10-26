@@ -28,7 +28,7 @@ from itertools import chain
 from pathlib import Path
 
 from . import crypto
-from .crypto import CHUNK, CryptoError, b64d, b64e, canon
+from .crypto import CHUNK, TAG, CryptoError, b64d, b64e, canon
 
 MAGIC = b"CVLT2"
 NAME_RE = re.compile(r"[a-z0-9_-]{1,32}")
@@ -178,6 +178,14 @@ class Vault:
         with open(src, "rb") as f:
             return self._store(iter(lambda: f.read(CHUNK), b""), meta, sign_key, {owner, *share_with})
 
+    def put_data(self, name: str, data: bytes, owner: str, password: str, share_with=()) -> str:
+        """Like put(), for bytes already in memory (web uploads)."""
+        _, sign_key = self.unlock(owner, password)
+        meta = {"name": Path(name).name or "unnamed", "size": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+                "owner": owner, "created": int(time.time())}
+        chunks = (data[i:i + CHUNK] for i in range(0, len(data), CHUNK))
+        return self._store(chunks, meta, sign_key, {owner, *share_with})
+
     def _store(self, chunks, meta: dict, sign_key, recipients) -> str:
         """The hybrid encryption itself: a fresh random key encrypts the data, and RSA wraps that key for each recipient."""
         enc_pubs = {r: self.public_keys(r)[0] for r in sorted(recipients)}  # fail on unknown users before doing any work
@@ -271,6 +279,24 @@ class Vault:
                 raise VaultError(f"{out} already exists; choose another output path")
             _write_atomic(out, self._plaintext(o))
             return out, o.meta
+
+    def read(self, ref: str, user: str, password: str):
+        """Decrypt into memory. Nothing is returned unless every check passed."""
+        # ponytail: whole file in memory; the web UI caps uploads at 100 MB, so this is bounded
+        with self._open(ref, user, password) as o:
+            return b"".join(self._plaintext(o)), o.meta
+
+    def inspect(self, ref: str, user: str, password: str) -> dict:
+        """Raw view of a container, for teaching: what anyone with disk access sees, next to what a recipient sees."""
+        with self._open(ref, user, password) as o:
+            o.stream.seek(0)
+            header, meta_ct = _read_container(o.stream)
+            disk_size = o.path.stat().st_size
+            data_len = disk_size - o.stream.tell()
+            data_head = o.stream.read(48)
+            return {"file": o.path.name, "disk_size": disk_size, "header": header, "meta_ct": meta_ct,
+                    "data_len": data_len, "data_head": data_head, "meta": o.meta,
+                    "segments": max(1, -(-data_len // (CHUNK + TAG)))}
 
     def verify(self, ref: str, user: str, password: str) -> dict:
         with self._open(ref, user, password) as o:

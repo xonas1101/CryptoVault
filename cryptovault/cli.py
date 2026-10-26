@@ -57,6 +57,9 @@ def parser():
     s.add_argument("id")
     s.add_argument("--from", dest="targets", type=user_list, required=True, metavar="U1,U2")
     command("rm", "delete a file (owner only)").add_argument("id")
+    s = command("serve", "run the web interface", user=False)
+    s.add_argument("--host", default="127.0.0.1", help="default 127.0.0.1 (this machine only)")
+    s.add_argument("--port", type=int, default=8000)
     return p
 
 
@@ -69,6 +72,12 @@ def run(args):
     if args.cmd == "users":
         for name in v.users():
             print(f"{name:<16} {v.fingerprint(name)}")
+        return
+    if args.cmd == "serve":
+        from .web import create_app
+        if args.host not in ("127.0.0.1", "localhost"):
+            print("WARNING: serving beyond this machine over plain HTTP. Passwords would cross the network unencrypted.")
+        create_app(args.vault).run(host=args.host, port=args.port)
         return
 
     pw = ask(f"Password for {args.user}: ")

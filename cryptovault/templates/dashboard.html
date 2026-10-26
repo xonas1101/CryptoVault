@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% block header %}
+<div class="row">
+  <span class="small muted">Signed in as <strong style="color:var(--text)">{{ user }}</strong> · key <code>{{ fingerprint }}</code></span>
+  <form method="post" action="/logout" style="margin:0"><button>Lock &amp; log out</button></form>
+</div>
+{% endblock %}
+{% block body %}
+<form class="card" method="post" action="/upload" enctype="multipart/form-data">
+  <h2>Lock a file</h2>
+  <input type="file" name="file" required>
+  {% if others %}
+    <label>Also give access to</label>
+    <div class="row" style="margin-bottom:12px">
+      {% for u in others %}<label class="check"><input type="checkbox" name="share" value="{{ u }}"> {{ u }}</label>{% endfor %}
+    </div>
+  {% endif %}
+  <button class="primary">Encrypt &amp; store</button>
+</form>
+
+<div class="card">
+  <h2>Files you can open</h2>
+  {% if not files %}
+    <p class="muted">Nothing here yet. Files shared with you will show up here too.</p>
+  {% else %}
+  <div class="table-wrap">
+  <table>
+    <tr><th>Name</th><th>Size</th><th>Owner</th><th>Stored</th><th>Access</th><th></th></tr>
+    {% for f in files %}
+      {% if f.error %}
+        <tr class="bad"><td colspan="6"><strong>⚠ {{ f.id[:8] }}</strong> failed verification: {{ f.error }}</td></tr>
+      {% else %}
+      <tr>
+        <td><strong>{{ f.name }}</strong><br><code class="small muted">{{ f.id[:8] }}</code></td>
+        <td>{{ f.size | size }}</td>
+        <td>{{ f.owner }}<br><span class="badge ok">✓ signature valid</span></td>
+        <td class="small">{{ f.created | when }}</td>
+        <td class="small">{{ f.recipients | join(", ") }}</td>
+        <td>
+          <div class="actions">
+            <a class="btn" href="/file/{{ f.id }}/download">Unlock &amp; download</a>
+            <form method="post" action="/file/{{ f.id }}/verify"><button>Verify</button></form>
+            <a class="btn" href="/file/{{ f.id }}/inspect">Inspect</a>
+          </div>
+          {% set can_add = others | reject("in", f.recipients) | list %}
+          {% if can_add %}
+          <details><summary>Share…</summary>
+            <form method="post" action="/file/{{ f.id }}/share">
+              {% for u in can_add %}<label class="check"><input type="checkbox" name="users" value="{{ u }}"> {{ u }}</label>{% endfor %}
+              <button>Share (re-wraps the key only)</button>
+            </form>
+          </details>
+          {% endif %}
+          {% if f.owner == user %}
+            {% set can_revoke = f.recipients | reject("equalto", user) | list %}
+            {% if can_revoke %}
+            <details><summary>Revoke…</summary>
+              <form method="post" action="/file/{{ f.id }}/revoke">
+                {% for u in can_revoke %}<label class="check"><input type="checkbox" name="users" value="{{ u }}"> {{ u }}</label>{% endfor %}
+                <button>Revoke (re-encrypts under a new key)</button>
+              </form>
+            </details>
+            {% endif %}
+            <details><summary>Delete…</summary>
+              <form method="post" action="/file/{{ f.id }}/delete"><button class="danger">Delete permanently</button></form>
+            </details>
+          {% endif %}
+        </td>
+      </tr>
+      {% endif %}
+    {% endfor %}
+  </table>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}
